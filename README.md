@@ -54,6 +54,27 @@ to inspect the plan first, or select a stricter policy below.
 No command prompts for input. Command data goes to stdout, diagnostics to stderr.
 Use `--json` for automation; do not parse the human display.
 
+## Tune each operation independently
+
+Fetching, checkout updates, and deletion have separate controls. Raising a
+cleanup level never changes sync's network activity or enables a reset.
+
+- **Everyday sync:** `repoman sync` fetches origin using its configured refspecs,
+  does not prune, and fast-forwards only a clean default checkout
+- **Refresh other remotes:** add `--fetch-scope all`
+- **Remove stale remote-tracking refs:** add `--prune`; use `--prune=false`
+  to override a saved setting. See the custom-refspec caveat below
+- **Reset active checkouts:** `--force` is a separate, invocation-only choice
+- **Delete inactive primary clones:** `--cleanup` is a separate,
+  invocation-only choice
+- **Retain more linked worktrees:** choose `clean --level balanced` or
+  `clean --level conservative`; the default is script-compatible
+  `aggressive`
+
+Start with `repoman sync --dry-run` and `repoman clean --dry-run` to see
+the effective settings and selected actions. Removing `--dry-run` applies
+them; **plain `clean` is not a preview**.
+
 ## Configuration
 
 On both macOS and Linux, configuration lookup uses this order:
