@@ -21,9 +21,15 @@ func DefaultPath() string {
 	if p := os.Getenv("REPOMAN_CONFIG"); p != "" {
 		return p
 	}
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
+	// Use the same XDG location on macOS and Linux. Relative XDG paths are
+	// invalid, so treat them like an unset value and fall back to ~/.config.
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if !filepath.IsAbs(dir) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".config")
 	}
 	return filepath.Join(dir, "repoman", "config.json")
 }

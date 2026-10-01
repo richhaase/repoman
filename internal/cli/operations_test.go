@@ -58,6 +58,95 @@ func TestConfigSelection(t *testing.T) {
 		t.Fatalf("error=%v", e)
 	}
 }
+func TestConfigPathPrecedence(t *testing.T) {
+	for _, tt := range []struct {
+		name, xdg, selected string
+		unsetXDG, env, flag bool
+	}{
+		{name: "absolute XDG", xdg: "absolute", selected: "xdg"},
+		{name: "unset XDG", unsetXDG: true, selected: "home"},
+		{name: "empty XDG", selected: "home"},
+		{name: "relative XDG", xdg: "relative", selected: "home"},
+		{name: "environment overrides defaults", xdg: "absolute", env: true, selected: "env"},
+		{name: "flag overrides environment and defaults", xdg: "absolute", env: true, flag: true, selected: "flag"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base, target := t.TempDir(), t.TempDir()
+			t.Chdir(base)
+			home, xdg := filepath.Join(base, "home"), filepath.Join(base, "xdg")
+			paths := map[string]string{
+				"home":     filepath.Join(home, ".config", "repoman", "config.json"),
+				"xdg":      filepath.Join(xdg, "repoman", "config.json"),
+				"relative": filepath.Join(base, "relative", "repoman", "config.json"),
+				"env":      filepath.Join(base, "env.json"),
+				"flag":     filepath.Join(base, "flag.json"),
+			}
+			data, err := json.Marshal(map[string]any{"targets": []any{map[string]any{"dir": target}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, path := range paths {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				content := []byte(`{"unsupported":true}`)
+				if name == tt.selected {
+					content = data
+				}
+				if err := os.WriteFile(path, content, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("REPOMAN_CONFIG", "")
+			if tt.env {
+				t.Setenv("REPOMAN_CONFIG", paths["env"])
+			}
+			t.Setenv("XDG_CONFIG_HOME", tt.xdg)
+			if tt.xdg == "absolute" {
+				t.Setenv("XDG_CONFIG_HOME", xdg)
+			}
+			if tt.unsetXDG {
+				if err := os.Unsetenv("XDG_CONFIG_HOME"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Selecting the configured root proves the intended file was loaded;
+			// every other candidate contains invalid configuration.
+			args := []string{"status", target, "--json"}
+			if tt.flag {
+				args = append(args, "--config", paths["flag"])
+			}
+			out, diag, err := executeCommand(t, t.Context(), args...)
+			if err != nil || diag != "" {
+				t.Fatalf("err=%v stderr=%q stdout=%s", err, diag, out)
+			}
+			var report envelope
+			if err := json.Unmarshal([]byte(out), &report); err != nil {
+				t.Fatal(err)
+			}
+			if report.Command != "status" || len(report.Errors) != 0 {
+				t.Fatalf("report=%s", out)
+			}
+		})
+	}
+}
+func TestRootBypassesConfig(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"unsupported":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REPOMAN_CONFIG", p)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "missing"))
+	for _, name := range []string{"status", "clean"} {
+		t.Run(name, func(t *testing.T) {
+			out, diag, err := executeCommand(t, t.Context(), name, "--root", t.TempDir(), "--config", p, "--json")
+			if err != nil || diag != "" {
+				t.Fatalf("err=%v stderr=%q stdout=%s", err, diag, out)
+			}
+		})
+	}
+}
 func TestJSONFlagsDoNotLeak(t *testing.T) {
 	dir := t.TempDir()
 	_, _, e := executeCommand(t, t.Context(), "status", "--root", dir, "--json")

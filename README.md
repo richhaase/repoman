@@ -47,9 +47,15 @@ Use `--json` for automation; do not parse the human display.
 
 ## Configuration
 
-The default is `$XDG_CONFIG_HOME/repoman/config.json` (or the OS user config
-location). Override with `REPOMAN_CONFIG` or `--config FILE`. The file is plain
-JSON, read-only to repoman; there is no implicit migration or registry write.
+On both macOS and Linux, repoman selects its configuration file in this order:
+
+1. An explicit `--config FILE`
+2. A non-empty `REPOMAN_CONFIG`
+3. `$XDG_CONFIG_HOME/repoman/config.json` when `XDG_CONFIG_HOME` is an absolute path
+4. `$HOME/.config/repoman/config.json` when `XDG_CONFIG_HOME` is unset, empty, or relative
+
+macOS uses these same paths, not `~/Library/Application Support`. The file is
+plain JSON, read-only to repoman; there is no implicit migration or registry write.
 
 ```json
 {
@@ -75,15 +81,22 @@ Includes/excludes are Go filepath globs on repository names; exclusions win.
 Sync and clean honor these selections (clean groups worktrees by primary clone).
 Status intentionally inventories every local checkout in the selected roots.
 
-Existing sync-repos JSON can be read explicitly:
+An original sync-repos JSON file can be copied unchanged to the repoman path
+above: both use the same `targets` schema with `dir`, `owner`, `days`, `events`,
+`includes`, and `excludes`. No legacy mode or schema conversion is needed.
+Alternatively, read the original file explicitly:
 
 ```sh
 repoman status --config ~/.config/sync-repos/config.json
 repoman sync ~/src --config ~/.config/sync-repos/config.json --no-events --dry-run
 ```
 
-This MVP uses GitHub push activity only. An explicit legacy `events: true` is
-rejected by sync unless `--no-events` is supplied. Days default to 45. Unlike the
+This MVP uses GitHub push activity only. **Copied configs with `events: true`
+require `--no-events` for sync**, including dry runs; the original script's `add`
+command defaults to `events: true`. Status and clean accept that field without
+using event activity. Unsupported extra fields are still rejected. Copying the
+configuration does not change repoman's cleanup policies or authorize removal.
+Days default to 45. Unlike the
 original scripts, there is no force-sync mode, automatic inactive-clone deletion,
 config mutation, or event-API fallback. Cleanup aggression is configured separately. Primary clones are inventoried and always
 kept by cleanup; retirement of inactive primary clones is deferred.
