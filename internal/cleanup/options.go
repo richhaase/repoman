@@ -5,8 +5,8 @@ import (
 	"strings"
 )
 
-// Level controls which positively established states qualify for cleanup.
-// Unknown state is protected at every level.
+// Level controls which worktrees qualify for cleanup.
+// Required identity, process and PR observation failures block every level.
 type Level string
 
 const (
@@ -15,18 +15,18 @@ const (
 	Aggressive   Level = "aggressive"
 )
 
-// Options controls cleanup eligibility. DiscardLocalChanges is an invocation-only
-// acknowledgement: persisted configuration must never enable it.
+// Options controls cleanup eligibility. DiscardLocalChanges is a deprecated
+// compatibility alias for aggressive cleanup, not a required acknowledgement.
 type Options struct {
 	Level               Level
 	DiscardLocalChanges bool
 }
 
-// ParseLevel validates a cleanup level. Empty values use the conservative default.
+// ParseLevel validates a cleanup level. Empty values use the aggressive default.
 func ParseLevel(raw string) (Level, error) {
 	level := Level(strings.ToLower(strings.TrimSpace(raw)))
 	if level == "" {
-		level = Conservative
+		level = Aggressive
 	}
 	switch level {
 	case Conservative, Balanced, Aggressive:
@@ -36,7 +36,7 @@ func ParseLevel(raw string) (Level, error) {
 	}
 }
 
-func (o Options) validate(apply bool) (Options, error) {
+func (o Options) validate(_ bool) (Options, error) {
 	level, err := ParseLevel(string(o.Level))
 	if err != nil {
 		return Options{}, err
@@ -45,8 +45,6 @@ func (o Options) validate(apply bool) (Options, error) {
 	if o.DiscardLocalChanges && level != Aggressive {
 		return Options{}, fmt.Errorf("--discard-local-changes requires the aggressive cleanup level")
 	}
-	if apply && level == Aggressive && !o.DiscardLocalChanges {
-		return Options{}, fmt.Errorf("applying aggressive cleanup requires --discard-local-changes; modified, staged, untracked, and ignored files may be permanently deleted")
-	}
+
 	return o, nil
 }

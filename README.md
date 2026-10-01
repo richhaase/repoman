@@ -1,61 +1,67 @@
 # repoman
 
-A small Go CLI for managing local clones and linked worktrees. Built from
-[richhaase/go-cli-template](https://github.com/richhaase/go-cli-template), using
-Cobra, constructor-scoped flags, context cancellation, structured output, and the
-template's build/release tooling. Template baseline: `27ed4591accb7628894d0a1cc23fff45840fe31b`.
+A Go CLI combining the repository synchronization and worktree cleanup workflows
+from [richhaase/dotfiles](https://github.com/richhaase/dotfiles). Built from
+[richhaase/go-cli-template](https://github.com/richhaase/go-cli-template), with
+Cobra, context cancellation, and human or structured JSON output.
 
-This is a conservative MVP inspired by `sync-repos` and `clean-repos` in
-[richhaase/dotfiles](https://github.com/richhaase/dotfiles). It does not install,
-replace, or invoke those scripts. Script reference baseline:
-`da7f57469464da9edf37bfed010f0286c56ec836`.
+Script reference baseline: `da7f57469464da9edf37bfed010f0286c56ec836`.
+Template baseline: `27ed4591accb7628894d0a1cc23fff45840fe31b`.
+Repoman does not install or invoke the original scripts.
 
 ## Build
 
 Requires the Go version pinned in `go.mod` (or newer), Git, and GitHub CLI (`gh`)
 for GitHub-backed operations. Authenticate `gh` separately; repoman never starts
-an interactive login flow. `status` needs only Git.
+an interactive login flow. macOS cleanup also requires `lsof` for process-cwd
+observation. Offline `status` needs only Git; missing process visibility is
+reported rather than represented as unused.
 
 ```sh
 make build
 ./bin/repoman --help
-./bin/repoman version
 make check
 ```
 
 ## Quick start
 
 ```sh
-# Read-only, offline inventory of direct child repositories and linked worktrees
-repoman status --root ~/src
+# Register a root; owner defaults to your authenticated GitHub account
+repoman config add ~/src
+repoman config list
+
+# Inspect every configured root without network access
+repoman status
 repoman status --root ~/src --json
 
-# Preview remote activity decisions without fetching or changing files
-repoman sync --root ~/src --owner richhaase --days 45 --dry-run
+# Preview synchronization, then clone/fetch/fast-forward active repositories
+repoman sync --dry-run
+repoman sync
 
-# Clone recently pushed, non-archived repos; fetch and safely fast-forward clones
-repoman sync --root ~/src --owner richhaase --exclude 'prototype-*'
+# Preview worktree cleanup, then remove eligible linked worktrees
+repoman clean --dry-run
+repoman clean
 
-# Cleanup is a preview unless explicitly applied
-repoman clean --root ~/src
-repoman clean --root ~/src --json
-repoman clean --root ~/src --apply
+# Opt into a stricter retention policy
+repoman clean --level conservative --dry-run
 ```
+
+**`clean` removes eligible linked worktrees by default**, matching `clean-repos`.
+Its default `aggressive` policy can discard dirty, untracked, and ignored files
+and detached local commits. Named branch refs are retained. Use `--dry-run`/`-n`
+to inspect the plan first, or select a stricter policy below.
 
 No command prompts for input. Command data goes to stdout, diagnostics to stderr.
 Use `--json` for automation; do not parse the human display.
 
 ## Configuration
 
-On both macOS and Linux, repoman selects its configuration file in this order:
+On both macOS and Linux, configuration lookup uses this order:
 
-1. An explicit `--config FILE`
-2. A non-empty `REPOMAN_CONFIG`
-3. `$XDG_CONFIG_HOME/repoman/config.json` when `XDG_CONFIG_HOME` is an absolute path
-4. `$HOME/.config/repoman/config.json` when `XDG_CONFIG_HOME` is unset, empty, or relative
-
-macOS uses these same paths, not `~/Library/Application Support`. The file is
-plain JSON, read-only to repoman; there is no implicit migration or registry write.
+1. Explicit `--config FILE`
+2. Non-empty `REPOMAN_CONFIG`
+3. `$XDG_CONFIG_HOME/repoman/config.json` when `XDG_CONFIG_HOME` is absolute
+4. `$HOME/.config/repoman/config.json` when it is unset, empty, or relative
 
 ```json
 {
@@ -65,7 +71,7 @@ plain JSON, read-only to repoman; there is no implicit migration or registry wri
       "owner": "richhaase",
       "days": 45,
       "events": false,
-      "cleanup_level": "conservative",
+      "cleanup_level": "aggressive",
       "includes": [],
       "excludes": ["prototype-*"]
     }
@@ -73,164 +79,192 @@ plain JSON, read-only to repoman; there is no implicit migration or registry wri
 }
 ```
 
-With no positional directory or `--root`, commands select all configured targets.
-A positional `DIR` selects that configured target. `--root DIR` bypasses config
-lookup for an ad hoc target. `clean --apply` requires exactly one selected target.
-Unknown config fields and malformed patterns are rejected rather than ignored.
-Includes/excludes are Go filepath globs on repository names; exclusions win.
-Sync and clean honor these selections (clean groups worktrees by primary clone).
-Status intentionally inventories every local checkout in the selected roots.
-
-An original sync-repos JSON file can be copied unchanged to the repoman path
-above: both use the same `targets` schema with `dir`, `owner`, `days`, `events`,
-`includes`, and `excludes`. No legacy mode or schema conversion is needed.
-Alternatively, read the original file explicitly:
+An original `sync-repos` JSON file can be copied unchanged to this path. The
+`targets` fields `dir`, `owner`, `days`, `events`, `includes`, and `excludes` are
+accepted directly, without conversion. You can also keep reading the original:
 
 ```sh
 repoman status --config ~/.config/sync-repos/config.json
-repoman sync ~/src --config ~/.config/sync-repos/config.json --no-events --dry-run
+repoman sync --config ~/.config/sync-repos/config.json --dry-run
 ```
 
-This MVP uses GitHub push activity only. **Copied configs with `events: true`
-require `--no-events` for sync**, including dry runs; the original script's `add`
-command defaults to `events: true`. Status and clean accept that field without
-using event activity. Unsupported extra fields are still rejected. Copying the
-configuration does not change repoman's cleanup policies or authorize removal.
-Days default to 45. Unlike the
-original scripts, there is no force-sync mode, automatic inactive-clone deletion,
-config mutation, or event-API fallback. Cleanup aggression is configured separately. Primary clones are inventoried and always
-kept by cleanup; retirement of inactive primary clones is deferred.
+Activity uses GitHub pushes only. Legacy `events: true` is accepted and produces
+one stderr notice per sync command explaining that event fallback is unsupported.
+`--no-events` explicitly selects push-only behavior and suppresses that notice.
+New registrations write `events: false`. No event API request is made.
 
-## Safety contract
+With no `DIR`, status/sync/clean select every configured target in config order.
+A positional `DIR` selects one registered target. `--root DIR` or its
+`--target`/`-t` alias selects an ad hoc root without loading config. Sync uses
+`--owner`/`-o` or the authenticated GitHub user when no owner is configured.
 
-### Status
+Unknown fields and malformed patterns are rejected. Includes/excludes use Go
+globs on repository names; exclusions win. Common `*`, `?`, character ranges,
+backslash escapes, and Bash negated classes such as `[!x]` work as before; `[^x]`
+is also accepted. Extended shell patterns such as `@(one|two)` and POSIX/locale
+classes such as `[[:alpha:]]` are rejected with a clear error. Use separate
+patterns or explicit character ranges for those cases. Sync and clean honor this selection
+(clean groups worktrees by primary clone). Status inventories all local checkouts
+under the selected roots. `days` defaults to 45 and affects sync activity, not
+linked-worktree retention.
 
-Discovers direct children of each root and their registered linked worktrees.
-Reports identity, branch/HEAD, origin, tracked/untracked/ignored state, upstream
-ahead/behind, local-only commits, stash, locks, and process-use observation.
-Git errors are unknown states, never clean states. Hidden index flags such as
-assume-unchanged and skip-worktree protect a checkout because status can conceal
-modified tracked files. `ahead`/`behind` of -1 mean an
-upstream comparison was unavailable. Local-only detection uses locally available
-remote refs; status does not fetch. Non-repository directories are not recursively
-searched. Symlink checkout entries and Git discovery inherited from a parent are rejected;
-inventory roots are canonicalized. Sync rejects symlink path components.
-
-### Sync
-
-Uses authenticated GitHub API metadata on github.com; repositories are selected
-by pushed time and include/exclude patterns. Empty, archived, and inactive repos
-are skipped. Existing destinations must be primary clones of the expected origin.
-Only clean default branches can fast-forward. Detached HEADs, other branches,
-local changes, ahead/diverged histories, locks, wrong origin, and unknown state
-are skipped or reported as errors. No hard reset, forced checkout, branch deletion,
-or all-remotes fetch is used. Dry-run performs remote reads but no clone/fetch.
-
-### Clean
-
-Cleanup always previews unless `--apply` is supplied. Choose a per-target
-`cleanup_level` in JSON or override it for this invocation with `clean --level`.
-The default is `conservative`; existing configurations retain their behavior.
-
-- **conservative:** keep the existing policy: the worktree must be completely clean
-  (including no untracked or ignored files), and GitHub must confirm a terminal PR
-  for the exact current HEAD in the same repository, with no associated open PR or
-  open PR on the current branch
-- **balanced:** also remove completely clean worktrees without a terminal PR, but
-  only after complete, successful GitHub checks establish no associated open PR or
-  open PR on the current branch. This deliberately treats an unassociated clean
-  checkout as disposable. The HEAD and all local branch commits must remain
-  reachable from locally recorded remote refs; absence of a PR alone is insufficient
-- **aggressive:** use balanced PR/commit eligibility, and also permit discarding
-  tracked changes, untracked files, and ignored files. Applying this level requires
-  the separate `--discard-local-changes` acknowledgement on every invocation, even
-  if the current plan happens to contain only clean worktrees. Selecting aggressive
-  in config does **not** authorize data loss
+### Manage targets
 
 ```sh
-# Preview a stricter or looser policy without modifying anything
-repoman clean --root ~/src --level balanced
-repoman clean --root ~/src --level aggressive --json
-
-# Apply a reviewed clean-worktree policy
-repoman clean --root ~/src --level balanced --apply
-
-# DANGER: permanently discard local file contents in eligible linked worktrees
-repoman clean --root ~/src --level aggressive --apply --discard-local-changes
-
-# Override a configured aggressive target back to the safe default
-repoman clean ~/src --level conservative --apply
+repoman config add ~/src --days 45 --exclude 'prototype-*'
+repoman config add ~/work --owner my-org --include 'service-*'
+repoman config add ~/work --owner my-org --excludes-file ./excluded-repos.txt
+repoman config list --json
+repoman config remove ~/work
 ```
 
-The discard flag is rejected with conservative or balanced levels. It cannot be
-persisted in configuration. Human previews label the effective policy and flag
-planned file loss; JSON includes the policy and a per-item destructive indicator.
-A preview is not a saved plan: applying builds a fresh plan from current evidence.
+`add` registers or replaces a target and appends it in config order. It replaces
+that target's sync settings; an existing `cleanup_level` is retained unless
+`--cleanup-level` overrides it. `remove` changes registration only; it does not
+delete clones or worktrees. `list --json` emits the configuration object for reuse.
+Exclusion files trim whitespace and ignore blank lines and lines starting with
+`#`; their patterns are appended to supplied exclusions.
 
-**Protections that no level overrides:** primary checkouts, paths outside the
-selected root, unknown Git or path identity, local-only committed work, stash,
-hidden-index flags (assume-unchanged/skip-worktree), submodules, locks, active Git
-operations, in-use checkouts/shared metadata, or incomplete process observation.
-Nested repositories and unsafe filesystem content are protected before aggressive
-removal. Branches are never deleted. A GitHub API failure, missing access,
-unsupported origin, or incomplete response is unknown evidence, never “no PR.”
-Remote tracking refs are not refreshed during cleanup.
+Only these management commands write config. Writes are atomic and retain an
+existing file's permissions. Existing symlinks are preserved by updating their
+resolved destination; dangling symlinks produce an error. Unrelated target values
+are preserved. Status, sync, and clean never rewrite the registry.
 
-`--apply` validates the complete inventory and GitHub evidence again before any
-mutation and rechecks each candidate immediately before removal. Aggressive
-candidates additionally receive content snapshots of the worktree and index so
-changed local bytes or newly discovered unsafe content abort removal. Each
-candidate is limited to 100,000 entries, 256 directory levels, and 256 MiB of
-snapshot input; unreadable
-content, larger candidates, special files, nested mounts, and nested repositories
-are kept rather than bypassing inspection. Symlink targets are not followed. Non-destructive removal uses
-`git worktree remove`; acknowledged destructive removal may use one `--force`.
-Locks are never overridden with double force, and there is no shell deletion
-fallback or metadata pruning.
+## Sync behavior
 
-Concurrent external Git/filesystem activity cannot be made atomic with a CLI
-check; stop other writers before applying. A late change aborts further removals
-and reports completed removals honestly. A failed attempted removal is marked
-`failed`, not assumed untouched. No rollback is promised.
+Select non-archived repositories with pushes inside the activity window. Fetch
+all pages of GitHub results, without the original script's 500-repository cap.
+Clone missing active repositories. For existing active primary clones, fetch all
+configured remotes and prune obsolete remote refs before deciding whether to
+update the checkout.
 
-Process-use detection is scoped to the current OS user (Linux /proc, macOS lsof).
-It does not claim visibility into other users or prevent new processes starting
-after inspection. An in-use sibling checkout or shared Git metadata protects all
-worktrees of that repository. No elevated privileges are needed or recommended.
+A clean default branch fast-forwards. Dirty/untracked files, another branch,
+detached HEAD, or ahead/diverged history leave the checkout as-is after fetching.
+Ignored build files and linked worktrees do not prevent ordinary synchronization.
+No default branch or missing origin default ref yields a fetch-only result.
+Destinations must still be the expected primary clone with the expected origin;
+identity errors are never treated as permission to modify another repository.
 
-## Output and exit codes
+```sh
+# Preview an explicit reset of active clones to their origin default branch
+repoman sync ~/src --force --dry-run
 
-All three commands return one JSON object with `schema_version: 1`, `command`,
+# Discard tracked changes/divergence and switch to the default branch
+repoman sync ~/src --force
+
+# Preview deletion of inactive primary clones
+repoman sync ~/src --cleanup --dry-run
+repoman sync ~/src --cleanup
+```
+
+`--force`/`-f` uses forced checkout of the default branch at origin's current
+commit, as `sync-repos` did. It does not run `git clean -fdx`. Git may remove
+untracked/ignored files that obstruct that checkout, but unrelated untracked
+content is not swept away.
+
+`--cleanup`/`-c` removes selected inactive primary clones when they have no tracked
+modifications or untracked files. Ignored files and local commits alone do not
+protect an inactive primary. **This deletes the clone and its contained Git
+history.** `--force` does not override the inactive-clone dirty check.
+
+One intentional fix to the original script: a primary with registered linked
+worktrees is retained, because deleting its shared Git metadata would break those
+worktrees. Normal fetching still works for that primary. Other deliberate fixes
+include complete pagination, exact repository identity checks, and a dry run that
+does not create directories or write Git metadata.
+
+## Clean behavior
+
+`clean` manages registered linked worktrees; primary clones are always retained
+here. Choose `cleanup_level` per target or override with `--level`. An existing
+explicit level remains respected; the aggressive default applies when no level
+is configured.
+
+- **aggressive (default):** the original `clean-repos` policy. Remove a linked
+  worktree unless it is explicitly locked, is a current-user process's working
+  directory, or is associated with an open GitHub PR. Dirty/untracked/ignored
+  files, local commits, stash, recent activity, or having no PR do not independently
+  retain it. No extra discard acknowledgement is required
+- **balanced:** retain local files and local-only committed work, and require
+  successful checks showing no open PR. This is an optional stricter policy
+- **conservative:** retain the balanced protections and require terminal PR
+  evidence for the current HEAD. This is the strictest optional policy
+
+```sh
+repoman clean --dry-run --json
+repoman clean ~/src
+repoman clean ~/src --level balanced --dry-run
+repoman clean ~/src --level conservative
+```
+
+The previous `--apply` flag remains a compatibility alias: `--apply=false`
+previews, while `--apply=true` applies. It cannot be combined with
+`--dry-run=true`. `--discard-local-changes` remains an optional deprecated
+aggressive-mode alias and is no longer required. `--days`/`-d` is accepted for
+script compatibility but has no effect on cleanup retention.
+
+The operation follows registrations from discovered repositories, including
+bare-repository anchors and linked worktrees outside the selected parent. It never deletes branch refs or
+fetches remotes. Aggressive removal uses one `git worktree remove --force`; it
+never overrides explicit locks with double force or falls back to shell deletion.
+An open shell in the primary does not protect an unrelated linked worktree.
+
+PR checks consider branch/commit associations and explicit PR-number hints from
+worktree names and local refs. Any relevant open PR retains the worktree. No
+match is distinct from a failed lookup. Non-GitHub repositories have no GitHub
+PR evidence and remain eligible under the default policy.
+
+The complete selected batch is inventoried and checked before any removal.
+Inventory, identity, required process-observation, or GitHub lookup failures abort
+that batch. Registration identity, locks, and cwd use are checked again before
+removing each candidate. Stale registrations are reported and pruned using Git's
+normal expiry rules. If another stale registration in the same repository is
+protected, bulk pruning is deferred so it cannot remove that registration. An
+unlocked missing worktree not marked prunable is an inventory error.
+
+Strict modes retain additional local-state protections. The default aggressive
+mode does not impose content-snapshot quotas or require all local commits to be
+published. A preview is not a saved plan; applying builds a fresh plan.
+
+Process observation covers the current OS user (Linux `/proc`, macOS `lsof`).
+Concurrent writers can still change state between checks and Git's operation.
+Failures stop further removals and report completed work; rollback is not promised.
+
+## Status and structured output
+
+Status discovers direct child repositories and registered worktrees, including
+identity, branch/HEAD, origin, tracked/untracked/ignored state, upstream distance,
+local-only commits, stash, locks, and process use. Git errors remain unknown
+states. Remote refs are not refreshed; `ahead`/`behind` of -1 means comparison was
+unavailable. Non-repository directories are not recursively scanned.
+
+Status/sync/clean emit one JSON object with `schema_version: 1`, `command`,
 `dry_run`, `items` (always an array), and `errors` (always an array). Human and JSON
-renderers consume the same results. Item actions explain planned, skipped, or
-completed work; a skipped safety check is not a successful update/removal.
-Cleanup additionally emits `cleanup_policies` for every selected root, including
-empty roots, with `level` and the requested `discard_local_changes` flag. Each
-cleanup item includes its effective level and `destructive` indicator. These are
-additive schema-v1 fields; `dry_run` and item `action` distinguish plans from actual
-removals. A requested discard flag alone never means data was deleted.
+renderers consume the same results. Cleanup also reports effective policies for
+every selected root, including empty roots, and per-item destructive indicators.
+Check actions and `dry_run` to distinguish plans from completed mutations.
 
-- `0`: completed inspection/action; intentional safety skips may remain
+- `0`: completed; intentional skips may remain
 - `1`: command/usage/runtime failure before a complete report
 - `2`: invalid target/config selection or cleanup options
-- `3`: report emitted with operation or inspection errors (possibly partial work)
+- `3`: report emitted with operation or inspection errors, possibly partial work
 - `130`: canceled by SIGINT/SIGTERM
 
-Consumers must check both exit status and individual item actions. Schema additions
-may be backward-compatible; incompatible changes will increment `schema_version`.
+Consumers must check both exit status and individual item actions. Incompatible
+output changes increment `schema_version`; additive fields may retain it.
 
-## Development and scope
+## Development
 
 ```sh
 make fmt
-make check                # fmt-check, vet, pinned lint, race tests
+make check                # formatting, vet, pinned lint, race tests
 make build
 make vuln
 make release-snapshot     # requires GoReleaser; local only
 ```
 
-CI runs the race-test suite on Linux and macOS, and cross-builds both CPU
-architectures. Tests create isolated temporary Git repositories and fake remote responses. They
-do not touch a user's clone registry or invoke the original cleanup scripts.
-No background service, task orchestration, editor integration, primary-clone
-deletion, GitHub Enterprise support, or release installation is included.
+CI tests Linux and macOS and cross-builds both CPU architectures. Tests use
+isolated temporary Git repositories and fake remote responses. They never execute
+the original scripts, mutate a user's registry, or clean actual user repositories.
+No background service, editor integration, GitHub Enterprise support, or automatic
+release installation is included.

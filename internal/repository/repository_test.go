@@ -281,7 +281,7 @@ func TestDiscoverInvalidAndMissingWorktree(t *testing.T) {
 		t.Fatalf("expected missing and invalid records: %+v", states)
 	}
 	for _, state := range states {
-		if state.Path != repo && len(state.Problems) == 0 {
+		if state.Path != repo && (!state.Missing || !state.Prunable || state.GitDir == "") && len(state.Problems) == 0 {
 			t.Fatalf("invalid state was unprotected: %+v", state)
 		}
 	}

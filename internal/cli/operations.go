@@ -73,6 +73,8 @@ func (o options) targets(args []string) ([]syncer.Target, error) {
 }
 func bind(cmd *cobra.Command, o *options) {
 	cmd.Flags().StringVar(&o.root, "root", "", "scan an ad hoc parent directory (no config lookup)")
+	cmd.Flags().StringVarP(&o.root, "target", "t", "", "alias for --root")
+	cmd.MarkFlagsMutuallyExclusive("root", "target")
 	cmd.Flags().StringVar(&o.configPath, "config", config.DefaultPath(), "JSON target config (or REPOMAN_CONFIG)")
 	cmd.Flags().BoolVar(&o.json, "json", false, "emit schema-versioned JSON on stdout")
 }
@@ -141,6 +143,15 @@ func newStatusCmd() *cobra.Command {
 					kind = "primary"
 				}
 				flags := []string{}
+				if s.Bare {
+					flags = append(flags, "bare")
+				}
+				if s.Missing {
+					flags = append(flags, "missing")
+				}
+				if s.Prunable {
+					flags = append(flags, "prunable registration")
+				}
 				if s.Dirty {
 					flags = append(flags, "dirty")
 				}
@@ -159,8 +170,13 @@ func newStatusCmd() *cobra.Command {
 				if s.Stash {
 					flags = append(flags, "stash")
 				}
-				if s.InUse {
-					flags = append(flags, "in use")
+				if s.CwdInUse {
+					flags = append(flags, "cwd in use")
+				} else if s.InUse {
+					flags = append(flags, "open file/process reference")
+				}
+				if !s.CwdInUseKnown {
+					flags = append(flags, "cwd use unknown")
 				}
 				if !s.InUseKnown {
 					flags = append(flags, "process use unknown")
@@ -200,14 +216,30 @@ func newStatusCmd() *cobra.Command {
 }
 func newSyncCmd() *cobra.Command {
 	var o options
-	var owner string
+	var owner, excludesFile string
 	var days int
-	var noEvents, dryRun bool
+	var noEvents, dryRun, force, cleanupInactive bool
 	var includes, excludes []string
-	cmd := &cobra.Command{Use: "sync [DIR]", Short: "Clone recently pushed repositories and safely fast-forward default branches", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "sync [DIR]", Short: "Clone and update active repositories; optionally force checkout or clean inactive clones", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		ts, e := selection(cmd, o, args)
 		if e != nil {
 			return e
+		}
+		fileExcludes := []string{}
+		if excludesFile != "" {
+			var err error
+			fileExcludes, err = syncer.ReadExcludesFile(excludesFile)
+			if err != nil {
+				return &ExitError{Code: 2, Err: err}
+			}
+		}
+		if !noEvents {
+			for _, target := range ts {
+				if target.Events != nil && *target.Events {
+					fmt.Fprintln(cmd.ErrOrStderr(), "notice: legacy events=true uses push activity; event fallback is no longer used (pass --no-events to suppress this notice)")
+					break
+				}
+			}
 		}
 		results := []syncer.Result{}
 		errs := []string{}
@@ -226,9 +258,9 @@ func newSyncCmd() *cobra.Command {
 			if cmd.Flags().Changed("include") {
 				t.Includes = includes
 			}
-			t.Excludes = append(t.Excludes, excludes...)
+			t.Excludes = append(append(append([]string{}, t.Excludes...), excludes...), fileExcludes...)
 			slog.DebugContext(cmd.Context(), "syncing target", "root", t.Dir, "owner", t.Owner, "dry_run", dryRun)
-			rs, e := syncer.Run(cmd.Context(), t, dryRun)
+			rs, e := syncer.RunWithOptions(cmd.Context(), t, syncer.Options{DryRun: dryRun, Force: force, Cleanup: cleanupInactive})
 			results = append(results, rs...)
 			if e != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
@@ -240,28 +272,40 @@ func newSyncCmd() *cobra.Command {
 		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs}, lines)
 	}}
 	bind(cmd, &o)
-	cmd.Flags().StringVar(&owner, "owner", "", "GitHub user or organization (required for ad hoc sync)")
-	cmd.Flags().IntVar(&days, "days", 45, "positive push-activity window in days")
+	cmd.Flags().StringVarP(&owner, "owner", "o", "", "GitHub user or organization (defaults to authenticated gh user)")
+	cmd.Flags().IntVarP(&days, "days", "d", 45, "positive push-activity window in days")
 	cmd.Flags().BoolVar(&noEvents, "no-events", false, "explicitly use push-only activity for legacy events=true configs")
-	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview; do not clone, fetch, or update")
+	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview clone, fetch, checkout, and inactive cleanup without changes")
 	cmd.Flags().StringArrayVar(&includes, "include", nil, "repository-name glob to include (repeatable)")
 	cmd.Flags().StringArrayVarP(&excludes, "exclude", "e", nil, "repository-name glob to exclude (repeatable; wins over includes)")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "discard local changes and force the default branch to origin (destructive)")
+	cmd.Flags().BoolVarP(&cleanupInactive, "cleanup", "c", false, "remove inactive primary clones without uncommitted or untracked changes (destructive)")
+	cmd.Flags().StringVar(&excludesFile, "excludes-file", "", "read exclude patterns from FILE (blank lines and # comments ignored)")
 	return cmd
 }
 func newCleanCmd() *cobra.Command {
 	var o options
-	var apply, discard bool
+	var apply, dryRun, discard bool
 	var level string
-	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Preview cleanup under a configurable policy; apply explicitly", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	var days int
+	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Remove eligible linked worktrees; --dry-run previews and --level opts into stricter checks", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("days") && days < 1 {
+			return &ExitError{Code: 2, Err: fmt.Errorf("--days must be positive (compatibility option; no retention effect)")}
+		}
+		if cmd.Flags().Changed("apply") && apply && dryRun {
+			return &ExitError{Code: 2, Err: fmt.Errorf("--apply and --dry-run cannot both be true")}
+		}
+		effectiveApply := !dryRun
+		if cmd.Flags().Changed("apply") && !apply {
+			effectiveApply = false
+		}
 		ts, e := selection(cmd, o, args)
 		if e != nil {
 			return e
 		}
-		if apply && len(ts) > 1 {
-			return &ExitError{Code: 2, Err: fmt.Errorf("--apply requires one target; select DIR or --root")}
-		}
 		policies := make([]cleanupPolicy, 0, len(ts))
-		// Validate every selected policy before inspecting or changing any target.
+		targets := make([]cleanup.Target, 0, len(ts))
+		lines := []string{}
 		for _, t := range ts {
 			raw := t.CleanupLevel
 			if cmd.Flags().Changed("level") {
@@ -275,50 +319,41 @@ func newCleanCmd() *cobra.Command {
 				return &ExitError{Code: 2, Err: err}
 			}
 			if discard && effective != cleanup.Aggressive {
-				return &ExitError{Code: 2, Err: fmt.Errorf("--discard-local-changes requires --level aggressive (or configured aggressive level)")}
-			}
-			if apply && effective == cleanup.Aggressive && !discard {
-				return &ExitError{Code: 2, Err: fmt.Errorf("aggressive apply can permanently discard tracked changes, untracked files, and ignored files; preview first, then explicitly pass --discard-local-changes")}
+				return &ExitError{Code: 2, Err: fmt.Errorf("--discard-local-changes is a compatibility alias for aggressive cleanup")}
 			}
 			policies = append(policies, cleanupPolicy{Root: t.Dir, Level: effective, DiscardLocalChanges: discard})
+			targets = append(targets, cleanup.Target{Root: filepath.Clean(t.Dir), Includes: t.Includes, Excludes: t.Excludes, Options: cleanup.Options{Level: effective, DiscardLocalChanges: discard}})
+			phase := "apply"
+			if !effectiveApply {
+				phase = "preview"
+			}
+			lines = append(lines, fmt.Sprintf("cleanup %s | level=%s | root=%q", phase, effective, t.Dir))
+			if effective == cleanup.Aggressive {
+				lines = append(lines, "Aggressive cleanup force-removes checkout files, including local changes; branch refs are retained")
+			}
 		}
-		results := []cleanup.Result{}
+		results, err := cleanup.RunBatch(cmd.Context(), targets, effectiveApply)
 		errs := []string{}
-		lines := []string{}
-		for i, t := range ts {
-			policy := policies[i]
-			phase := "preview"
-			if apply {
-				phase = "apply"
-			}
-			lines = append(lines, fmt.Sprintf("cleanup %s | level=%s | root=%q", phase, policy.Level, t.Dir))
-			if policy.Level == cleanup.Aggressive {
-				lines = append(lines, "WARNING: aggressive cleanup can permanently discard tracked changes, untracked files, and ignored files")
-				if !apply {
-					lines = append(lines, "Preview only. Applying aggressive cleanup requires --apply --discard-local-changes")
-				}
-			}
-			slog.DebugContext(cmd.Context(), "planning cleanup", "root", t.Dir, "apply", apply, "level", policy.Level)
-			rs, e := cleanup.RunWithOptions(cmd.Context(), filepath.Clean(t.Dir), apply, t.Includes, t.Excludes, cleanup.Options{Level: policy.Level, DiscardLocalChanges: discard})
-			results = append(results, rs...)
-			if e != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
-			} else if len(rs) == 0 {
-				lines = append(lines, "No repositories found")
-			}
-			for _, r := range rs {
-				destructive := ""
-				if r.Destructive {
-					destructive = " [DISCARDS LOCAL FILES]"
-				}
-				lines = append(lines, fmt.Sprintf("%-14s %q%s: %s", r.Action, r.Path, destructive, r.Reason))
-			}
+		if err != nil {
+			errs = append(errs, err.Error())
 		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !apply, Items: results, Errors: errs, CleanupPolicies: policies}, lines)
+		if len(results) == 0 && err == nil {
+			lines = append(lines, "No repositories found")
+		}
+		for _, r := range results {
+			destructive := ""
+			if r.Destructive {
+				destructive = " [FORCE REMOVAL]"
+			}
+			lines = append(lines, fmt.Sprintf("%-14s %q%s: %s", r.Action, r.Path, destructive, r.Reason))
+		}
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !effectiveApply, Items: results, Errors: errs, CleanupPolicies: policies}, lines)
 	}}
 	bind(cmd, &o)
-	cmd.Flags().BoolVar(&apply, "apply", false, "revalidate the selected policy and remove eligible worktrees")
-	cmd.Flags().StringVar(&level, "level", "", "cleanup level: conservative (default), balanced, or aggressive; overrides config")
-	cmd.Flags().BoolVar(&discard, "discard-local-changes", false, "authorize permanent loss of tracked changes, untracked files, and ignored files; required for aggressive apply")
+	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview eligible removals and metadata pruning without changing anything")
+	cmd.Flags().BoolVar(&apply, "apply", true, "compatibility alias: true applies; false previews")
+	cmd.Flags().StringVar(&level, "level", "", "cleanup level: aggressive (default), balanced, or conservative; overrides config")
+	cmd.Flags().BoolVar(&discard, "discard-local-changes", false, "deprecated compatibility alias for aggressive cleanup; no acknowledgement is required")
+	cmd.Flags().IntVarP(&days, "days", "d", 45, "positive compatibility option; does not affect cleanup retention")
 	return cmd
 }
