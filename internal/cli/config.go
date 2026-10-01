@@ -36,7 +36,7 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 	var includes, excludes []string
 	cmd := &cobra.Command{
 		Use:   "add DIR",
-		Short: "Register or replace a target, appending it in configuration order",
+		Short: "Save a folder and its sync settings",
 		Long:  "Register or replace a target's sync settings. Omitted owner, days, and filter flags use their defaults. Existing cleanup level, fetch scope, and pruning settings are retained unless their flags are supplied. New registrations use push-only activity (events=false), fetch origin, and do not prune.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -91,7 +91,7 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 			if o.json {
 				return configJSON(cmd, updated)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Registered target %q in %s\n", dir, o.path)
+			fmt.Fprintf(cmd.OutOrStdout(), "Saved target: %s\nConfig: %s\n\n", humanText(dir), humanText(o.path))
 			printConfigTarget(cmd, updated.Targets[len(updated.Targets)-1])
 			return nil
 		},
@@ -111,7 +111,7 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 func newConfigListCmd(o *configOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "Show configured targets in configuration order",
+		Short: "List saved folders and their settings",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := cmd.Context().Err(); err != nil {
@@ -125,9 +125,19 @@ func newConfigListCmd(o *configOptions) *cobra.Command {
 				return configJSON(cmd, c)
 			}
 			if len(c.Targets) == 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "No configured targets in %s\n", o.path)
+				fmt.Fprintf(cmd.OutOrStdout(), "No configured targets in %s\nAdd one with: repoman config add ~/src\n", humanText(o.path))
 			}
-			for _, target := range c.Targets {
+			if len(c.Targets) > 0 {
+				label := "targets"
+				if len(c.Targets) == 1 {
+					label = "target"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Config: %s\n%d configured %s\n\n", humanText(o.path), len(c.Targets), label)
+			}
+			for i, target := range c.Targets {
+				if i > 0 {
+					fmt.Fprintln(cmd.OutOrStdout())
+				}
 				printConfigTarget(cmd, target)
 			}
 			return nil
@@ -155,7 +165,7 @@ func newConfigRemoveCmd(o *configOptions) *cobra.Command {
 			if o.json {
 				return configJSON(cmd, updated)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Removed target %q from %s\n", dir, o.path)
+			fmt.Fprintf(cmd.OutOrStdout(), "Removed target: %s\nConfig: %s\nRepository files were not changed\n", humanText(dir), humanText(o.path))
 			return nil
 		},
 	}
@@ -175,25 +185,33 @@ func configJSON(cmd *cobra.Command, c config.Config) error {
 func printConfigTarget(cmd *cobra.Command, target syncer.Target) {
 	owner := target.Owner
 	if owner == "" {
-		owner = "(authenticated gh user)"
+		owner = "authenticated GitHub user"
 	}
 	days := target.Days
 	if days == 0 {
 		days = 45
 	}
-	events := target.Events != nil && *target.Events
-	includes, excludes := "(all)", "(none)"
+	scope, _ := syncer.ParseFetchScope(target.FetchScope)
+	level := target.CleanupLevel
+	if level == "" {
+		level = "aggressive"
+	}
+	h := newHumanReport(cmd, false)
+	h.line("%s", humanText(target.Dir))
+	h.line("  owner:    %s", humanText(owner))
+	h.line("  window:   %d days · push activity", days)
+	h.line("  fetch:    %s · prune %s", scope, onOff(target.Prune))
+	h.line("  clean:    %s", humanText(level))
+	inc, exc := "all", "none"
 	if len(target.Includes) > 0 {
-		includes = strings.Join(target.Includes, ", ")
+		inc = strings.Join(target.Includes, ", ")
 	}
 	if len(target.Excludes) > 0 {
-		excludes = strings.Join(target.Excludes, ", ")
+		exc = strings.Join(target.Excludes, ", ")
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s\n  owner: %s   days: %d   events: %t   includes: %s   excludes: %s", target.Dir, owner, days, events, includes, excludes)
-	if target.CleanupLevel != "" {
-		fmt.Fprintf(cmd.OutOrStdout(), "   cleanup_level: %s", target.CleanupLevel)
+	h.line("  include:  %s", humanText(inc))
+	h.line("  exclude:  %s", humanText(exc))
+	if target.Events != nil && *target.Events {
+		h.line("  activity: legacy events setting retained; sync uses pushes only")
 	}
-	fetchScope, _ := syncer.ParseFetchScope(target.FetchScope) // Config reads and writes validate the scope.
-	fmt.Fprintf(cmd.OutOrStdout(), "   fetch_scope: %s   prune: %t", fetchScope, target.Prune)
-	fmt.Fprintln(cmd.OutOrStdout())
 }

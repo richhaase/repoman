@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/richhaase/repoman/internal/progress"
 	"github.com/richhaase/repoman/internal/repopattern"
 	"github.com/richhaase/repoman/internal/repository"
 )
@@ -113,6 +114,7 @@ func (e *engine) runWithOptions(ctx context.Context, target Target, options Opti
 	if err := checkRoot(target.Dir); err != nil {
 		return nil, err
 	}
+	progress.Report(ctx, progress.Event{Phase: "list", Detail: "Listing GitHub repositories for " + target.Owner})
 	repos, err := e.list(ctx, target.Owner)
 	if err != nil {
 		return nil, err
@@ -153,6 +155,7 @@ func (e *engine) runWithOptions(ctx context.Context, target Target, options Opti
 			failures = append(failures, fmt.Errorf("%s: %w", repo.Name, actionErr))
 		}
 		results = append(results, result)
+		progress.Report(ctx, progress.Event{Phase: "sync-result", Value: result})
 	}
 	return results, errors.Join(failures...)
 }
@@ -282,8 +285,22 @@ func (e *engine) syncOne(ctx context.Context, target Target, repo remoteRepo, dr
 
 func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo remoteRepo, options Options) (Result, error) {
 	result := Result{Name: repo.Name, Path: filepath.Join(target.Dir, repo.Name), Action: "skipped"}
+	checkout := ""
+	defer func() {
+		if checkout != "" {
+			progress.Report(ctx, progress.Event{Phase: "checkout", Path: result.Path, Detail: checkout})
+		}
+	}()
 	scope, prune, err := fetchOptions(target, options)
 	if err != nil {
+		return result, err
+	}
+	phase := "syncing"
+	if options.DryRun {
+		phase = "checking preview"
+	}
+	progress.Report(ctx, progress.Event{Phase: "sync-start", Path: result.Path, Detail: phase})
+	if err := ctx.Err(); err != nil {
 		return result, err
 	}
 	if err := checkRoot(target.Dir); err != nil {
@@ -328,6 +345,7 @@ func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo rem
 	if repo.DefaultBranch != nil {
 		branch = repo.DefaultBranch.Name
 	}
+	checkout = state.Branch + "\x00" + branch
 	if options.DryRun {
 		result.Action = "would-fetch"
 		fetch := "would fetch " + fetchDescription(scope, prune)
@@ -359,6 +377,7 @@ func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo rem
 	if len(after.Problems) > 0 {
 		return result, fmt.Errorf("inspect checkout after fetch: %s", strings.Join(after.Problems, "; "))
 	}
+	checkout = after.Branch + "\x00" + branch
 	if !options.Force {
 		if reason := checkoutReason(after, branch); reason != "" {
 			result.Reason = reason + "; fetched only"

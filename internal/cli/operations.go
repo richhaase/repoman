@@ -13,14 +13,16 @@ import (
 
 	"github.com/richhaase/repoman/internal/cleanup"
 	"github.com/richhaase/repoman/internal/config"
+	"github.com/richhaase/repoman/internal/progress"
 	"github.com/richhaase/repoman/internal/repository"
 	"github.com/richhaase/repoman/internal/syncer"
 )
 
 // ExitError preserves structured output while communicating a partial failure.
 type ExitError struct {
-	Code int
-	Err  error
+	Code     int
+	Err      error
+	Reported bool
 }
 
 func (e *ExitError) Error() string { return e.Err.Error() }
@@ -54,6 +56,7 @@ type cleanupPolicy struct {
 type options struct {
 	root, configPath string
 	json             bool
+	report           *humanReport
 }
 
 func (o options) targets(args []string) ([]syncer.Target, error) {
@@ -89,33 +92,28 @@ func bind(cmd *cobra.Command, o *options) {
 	cmd.Flags().StringVar(&o.configPath, "config", config.DefaultPath(), "JSON target config (or REPOMAN_CONFIG)")
 	cmd.Flags().BoolVar(&o.json, "json", false, "emit schema-versioned JSON on stdout")
 }
-func output(cmd *cobra.Command, o options, env envelope, lines []string) error {
+func output(cmd *cobra.Command, o options, env envelope) error {
 	if o.json {
-		e := json.NewEncoder(cmd.OutOrStdout())
-		e.SetEscapeHTML(false)
-		e.SetIndent("", "  ")
-		if err := e.Encode(env); err != nil {
+		encoder := json.NewEncoder(cmd.OutOrStdout())
+		encoder.SetEscapeHTML(false)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(env); err != nil {
 			return err
 		}
+		for _, warning := range env.Warnings {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", humanText(warning))
+		}
 	} else {
-		for _, s := range lines {
-			fmt.Fprintln(cmd.OutOrStdout(), s)
-		}
-		if len(lines) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "No repositories found")
-		}
-		for _, s := range env.Errors {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", s)
-		}
-	}
-	for _, warning := range env.Warnings {
-		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
+		o.report.finish(env)
 	}
 	if err := cmd.Context().Err(); err != nil {
+		if !o.json {
+			return &ExitError{Code: 130, Err: err, Reported: true}
+		}
 		return err
 	}
 	if len(env.Errors) > 0 {
-		return &ExitError{Code: 3, Err: errors.New("completed with errors; see reported details")}
+		return &ExitError{Code: 3, Err: errors.New("completed with errors; see reported details"), Reported: !o.json}
 	}
 	return nil
 }
@@ -131,101 +129,40 @@ func selection(cmd *cobra.Command, o options, args []string) ([]syncer.Target, e
 }
 func newStatusCmd() *cobra.Command {
 	var o options
-	cmd := &cobra.Command{Use: "status [DIR]", Short: "Inventory primary clones and linked worktrees without network access", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		ts, e := selection(cmd, o, args)
-		if e != nil {
-			return e
+	cmd := &cobra.Command{Use: "status [DIR]", Short: "See clones, branches, and worktrees without network access", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		ts, err := selection(cmd, o, args)
+		if err != nil {
+			return err
 		}
+		o.report = newHumanReport(cmd, o.json)
 		states := []repository.State{}
 		errs := []string{}
-		lines := []string{}
 		seen := map[string]bool{}
 		for _, t := range ts {
-			slog.DebugContext(cmd.Context(), "inspecting target", "root", t.Dir)
-			ss, e := repository.Discover(cmd.Context(), t.Dir)
-			if e != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
+			o.report.target(t.Dir, "Status · read only", o.root != "")
+			o.report.line("  · Checking local repositories")
+			ss, err := repository.Discover(cmd.Context(), t.Dir)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, err))
 			}
-			for _, s := range ss {
-				if seen[s.Path] {
+			unique := []repository.State{}
+			for _, state := range ss {
+				if seen[state.Path] {
 					continue
 				}
-				seen[s.Path] = true
-				states = append(states, s)
-				kind := "worktree"
-				if s.Primary {
-					kind = "primary"
-				}
-				flags := []string{}
-				if s.Bare {
-					flags = append(flags, "bare")
-				}
-				if s.Missing {
-					flags = append(flags, "missing")
-				}
-				if s.Prunable {
-					flags = append(flags, "prunable registration")
-				}
-				if s.Dirty {
-					flags = append(flags, "dirty")
-				}
-				if s.Untracked {
-					flags = append(flags, "untracked")
-				}
-				if s.Ignored {
-					flags = append(flags, "ignored")
-				}
-				if s.Locked {
-					flags = append(flags, "locked")
-				}
-				if s.Unique {
-					flags = append(flags, "local-only commits")
-				}
-				if s.Stash {
-					flags = append(flags, "stash")
-				}
-				if s.CwdInUse {
-					flags = append(flags, "cwd in use")
-				} else if s.InUse {
-					flags = append(flags, "open file/process reference")
-				}
-				if !s.CwdInUseKnown {
-					flags = append(flags, "cwd use unknown")
-				}
-				if !s.InUseKnown {
-					flags = append(flags, "process use unknown")
-				}
-				if len(s.Problems) > 0 {
-					flags = append(flags, "unknown")
-					errs = append(errs, fmt.Sprintf("%s: %s", s.Path, strings.Join(s.Problems, "; ")))
-				}
-				if len(flags) == 0 {
-					flags = append(flags, "clean")
-				}
-				branch := s.Branch
-				if branch == "" {
-					branch = "detached"
-				}
-				distance := "upstream unknown"
-				if s.Ahead >= 0 && s.Behind >= 0 {
-					distance = fmt.Sprintf("+%d/-%d", s.Ahead, s.Behind)
-				}
-				head := s.Head
-				if len(head) > 12 {
-					head = head[:12]
-				}
-				if head == "" {
-					head = "unknown HEAD"
-				}
-				lines = append(lines, fmt.Sprintf("%-8s %q\n         %s @ %s | %s | %s", kind, s.Path, branch, head, distance, strings.Join(flags, ", ")))
-				if len(s.SafetyProblems) > 0 {
-					lines = append(lines, fmt.Sprintf("         process observation: %s", s.SafetyProblems[0]))
+				seen[state.Path] = true
+				states = append(states, state)
+				unique = append(unique, state)
+				if len(state.Problems) > 0 {
+					errs = append(errs, fmt.Sprintf("%s: %s", state.Path, strings.Join(state.Problems, "; ")))
 				}
 			}
+			o.report.statusStates(unique)
 		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "status", DryRun: true, Items: states, Errors: errs}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "status", DryRun: true, Items: states, Errors: errs})
 	}}
 	bind(cmd, &o)
+	cmd.Example = "  repoman status\n  repoman status --root ~/src\n  repoman status --json"
 	return cmd
 }
 func newSyncCmd() *cobra.Command {
@@ -246,7 +183,7 @@ func newSyncCmdWithRunner(run func(context.Context, syncer.Target, syncer.Option
 	var days int
 	var noEvents, dryRun, force, cleanupInactive, prune bool
 	var includes, excludes []string
-	cmd := &cobra.Command{Use: "sync [DIR]", Short: "Clone and update active repositories; optionally force checkout or clean inactive clones", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "sync [DIR]", Short: "Clone and update your active GitHub repositories", Long: "Clone missing active repositories and fetch existing clones. Clean default branches fast-forward.\n\nFetch scope and pruning are independent. --force resets active checkouts;\n--cleanup removes eligible inactive clones. Neither is enabled by fetching.\nUse --dry-run to see the effective settings and planned work first.", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("fetch-scope") {
 			if err := validateFetchScopeFlag(fetchScope); err != nil {
 				return &ExitError{Code: 2, Err: err}
@@ -274,7 +211,7 @@ func newSyncCmdWithRunner(run func(context.Context, syncer.Target, syncer.Option
 		}
 		results := []syncer.Result{}
 		errs := []string{}
-		lines := []string{}
+		o.report = newHumanReport(cmd, o.json)
 		policies := make([]syncPolicy, 0, len(ts))
 		syncOptions := syncer.Options{DryRun: dryRun, Force: force, Cleanup: cleanupInactive, FetchScope: fetchScope}
 		if cmd.Flags().Changed("prune") {
@@ -309,21 +246,24 @@ func newSyncCmdWithRunner(run func(context.Context, syncer.Target, syncer.Option
 			if dryRun {
 				phase = "preview"
 			}
-			lines = append(lines, fmt.Sprintf("sync %s | fetch_scope=%s | prune=%t | force=%t | cleanup=%t | root=%q", phase, scope, effectivePrune, force, cleanupInactive, t.Dir))
+			o.report.target(t.Dir, "Sync · "+phase, o.root != "")
+			o.report.syncHeader(t, policies[len(policies)-1], dryRun)
 			slog.DebugContext(cmd.Context(), "syncing target", "root", t.Dir, "owner", t.Owner, "dry_run", dryRun)
-			rs, e := run(cmd.Context(), t, syncOptions)
+			ctx := cmd.Context()
+			if o.report != nil {
+				ctx = progress.WithReporter(ctx, o.report.event)
+			}
+			rs, e := run(ctx, t, syncOptions)
 			results = append(results, rs...)
 			if e != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
 			}
 			for _, r := range rs {
-				lines = append(lines, fmt.Sprintf("%-14s %s: %s", r.Action, r.Name, r.Reason))
+				o.report.syncResult(r)
 			}
+			o.report.syncError(t.Dir, e)
 		}
-		if len(results) == 0 && len(errs) == 0 {
-			lines = append(lines, "No repositories found")
-		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs, SyncPolicies: policies}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs, SyncPolicies: policies})
 	}}
 	bind(cmd, &o)
 	cmd.Flags().StringVarP(&owner, "owner", "o", "", "GitHub user or organization (defaults to authenticated gh user)")
@@ -337,6 +277,7 @@ func newSyncCmdWithRunner(run func(context.Context, syncer.Target, syncer.Option
 	cmd.Flags().BoolVar(&prune, "prune", false, "prune stale remote-tracking refs when fetching; overrides target config (use --prune=false to disable)")
 	cmd.Flags().BoolVarP(&cleanupInactive, "cleanup", "c", false, "remove inactive primary clones without uncommitted or untracked changes (destructive)")
 	cmd.Flags().StringVar(&excludesFile, "excludes-file", "", "read exclude patterns from FILE (blank lines and # comments ignored)")
+	cmd.Example = "  repoman sync --dry-run\n  repoman sync\n  repoman sync --fetch-scope all --prune\n  repoman sync --force --dry-run"
 	return cmd
 }
 func newCleanCmd() *cobra.Command {
@@ -348,7 +289,7 @@ func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]
 	var apply, dryRun, discard bool
 	var level string
 	var days int
-	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Remove eligible linked worktrees; --dry-run previews and --level opts into stricter checks", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Remove eligible linked worktrees (applies by default)", Long: "Remove eligible linked worktrees; primary clones are always kept.\n\nThis command applies immediately unless --dry-run is used. The default\naggressive policy can discard local checkout files, including local changes;\nbranch refs are retained. Choose balanced or conservative to retain more work.", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("days") && days < 1 {
 			return &ExitError{Code: 2, Err: fmt.Errorf("--days must be positive (compatibility option; no retention effect)")}
 		}
@@ -365,7 +306,7 @@ func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]
 		}
 		policies := make([]cleanupPolicy, 0, len(ts))
 		targets := make([]cleanup.Target, 0, len(ts))
-		lines := []string{}
+		o.report = newHumanReport(cmd, o.json)
 		for _, t := range ts {
 			raw := t.CleanupLevel
 			if cmd.Flags().Changed("level") {
@@ -383,22 +324,31 @@ func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]
 			}
 			policies = append(policies, cleanupPolicy{Root: t.Dir, Level: effective, DiscardLocalChanges: discard})
 			targets = append(targets, cleanup.Target{Root: filepath.Clean(t.Dir), Includes: t.Includes, Excludes: t.Excludes, Options: cleanup.Options{Level: effective, DiscardLocalChanges: discard}})
+
+		}
+		for i, t := range ts {
 			phase := "apply"
 			if !effectiveApply {
 				phase = "preview"
 			}
-			lines = append(lines, fmt.Sprintf("cleanup %s | level=%s | root=%q", phase, effective, t.Dir))
-			if effective == cleanup.Aggressive {
-				lines = append(lines, "Aggressive cleanup force-removes checkout files, including local changes; branch refs are retained")
+			o.report.target(t.Dir, "Clean · "+phase, o.root != "")
+			o.report.line("policy:   %s", policies[i].Level)
+			o.report.filters(t.Includes, t.Excludes)
+			if policies[i].Level == cleanup.Aggressive {
+				o.report.line("! Removes checkout files, including local changes; branch refs are retained")
+			}
+			if !effectiveApply {
+				o.report.line("Preview only · nothing will be changed")
 			}
 		}
-		results, err := run(cmd.Context(), targets, effectiveApply)
+		ctx := cmd.Context()
+		if o.report != nil {
+			ctx = progress.WithReporter(ctx, o.report.event)
+		}
+		results, err := run(ctx, targets, effectiveApply)
 		errs := []string{}
 		if err != nil {
 			errs = append(errs, err.Error())
-		}
-		if len(results) == 0 && err == nil {
-			lines = append(lines, "No repositories found")
 		}
 		warnings := []string{}
 		seenWarnings := map[string]bool{}
@@ -409,13 +359,9 @@ func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]
 					seenWarnings[warning] = true
 				}
 			}
-			destructive := ""
-			if r.Destructive {
-				destructive = " [FORCE REMOVAL]"
-			}
-			lines = append(lines, fmt.Sprintf("%-14s %q%s: %s", r.Action, r.Path, destructive, r.Reason))
 		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !effectiveApply, Items: results, Errors: errs, CleanupPolicies: policies, Warnings: warnings}, lines)
+		o.report.cleanResults(results, false)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !effectiveApply, Items: results, Errors: errs, CleanupPolicies: policies, Warnings: warnings})
 	}}
 	bind(cmd, &o)
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview eligible removals and metadata pruning without changing anything")
@@ -423,5 +369,9 @@ func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]
 	cmd.Flags().StringVar(&level, "level", "", "cleanup level: aggressive (default), balanced, or conservative; overrides config")
 	cmd.Flags().BoolVar(&discard, "discard-local-changes", false, "deprecated compatibility alias for aggressive cleanup; no acknowledgement is required")
 	cmd.Flags().IntVarP(&days, "days", "d", 45, "positive compatibility option; does not affect cleanup retention")
+	cmd.Example = "  repoman clean --dry-run\n  repoman clean\n  repoman clean --level conservative --dry-run"
+	for _, name := range []string{"apply", "discard-local-changes", "days"} {
+		_ = cmd.Flags().MarkHidden(name)
+	}
 	return cmd
 }

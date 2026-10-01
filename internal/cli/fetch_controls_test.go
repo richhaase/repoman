@@ -178,10 +178,10 @@ func TestSyncHumanEffectiveFetchControlsAndFlagIsolation(t *testing.T) {
 	root, _ := syncCLIFixture(t)
 	for _, override := range []bool{true, false} {
 		args := []string{"sync", "--root", filepath.Join(root, "clones"), "--owner", "alice", "--dry-run"}
-		want := "sync preview | fetch_scope=origin | prune=false | force=false | cleanup=false"
+		want := "fetch:    origin · prune off\nforce:    off\ncleanup:  off"
 		if override {
 			args = append(args, "--fetch-scope", "all", "--prune", "--force", "--cleanup")
-			want = "sync preview | fetch_scope=all | prune=true | force=true | cleanup=true"
+			want = "fetch:    all · prune on\nforce:    on\ncleanup:  on"
 		}
 		out, diag, err := executeCommand(t, t.Context(), args...)
 		if err != nil || diag != "" || !strings.Contains(out, want) || !strings.Contains(out, "No repositories found") {

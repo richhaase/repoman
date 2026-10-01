@@ -122,7 +122,7 @@ func TestCleanupHumanPolicyAndWarningEvenWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"cleanup apply", "level=aggressive", "including local changes", "branch refs are retained"} {
+	for _, want := range []string{"Clean · apply", "policy:   aggressive", "including local changes", "branch refs are retained"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q from %s", want, out)
 		}
@@ -135,7 +135,7 @@ func TestCleanupLevelFlagsDoNotLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, _, err := executeCommand(t, t.Context(), "clean", "--root", root)
-	if err != nil || !strings.Contains(out, "level=aggressive") || !strings.Contains(out, "cleanup apply") {
+	if err != nil || !strings.Contains(out, "policy:   aggressive") || !strings.Contains(out, "Clean · apply") {
 		t.Fatalf("out=%s err=%v", out, err)
 	}
 }
