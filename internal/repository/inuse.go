@@ -14,12 +14,19 @@ import (
 )
 
 type processUsage struct {
+	cwdOnly  bool
 	paths    []string
 	problems []string
 }
 
-func observeProcesses(ctx context.Context) processUsage {
-	var usage processUsage
+func observeProcesses(ctx context.Context) processUsage { return observeProcessMode(ctx, false) }
+
+func observeWorkingDirectories(ctx context.Context) processUsage {
+	return observeProcessMode(ctx, true)
+}
+
+func observeProcessMode(ctx context.Context, cwdOnly bool) processUsage {
+	usage := processUsage{cwdOnly: cwdOnly}
 	cwd, err := os.Getwd()
 	if err != nil {
 		usage.problems = append(usage.problems, "cannot determine current working directory: "+err.Error())
@@ -80,13 +87,20 @@ func (u *processUsage) observeProc(ctx context.Context, root string) {
 			continue // The supported observation contract covers the invoking user.
 		}
 		observed++
-		for _, name := range []string{"cwd", "exe"} {
+		names := []string{"cwd", "exe"}
+		if u.cwdOnly {
+			names = []string{"cwd"}
+		}
+		for _, name := range names {
 			path, linkErr := os.Readlink(filepath.Join(dir, name))
 			if linkErr == nil {
 				u.addPath(path)
 			} else if !errors.Is(linkErr, os.ErrNotExist) || (name == "cwd" && liveProcess(dir)) {
 				u.observationError(dir, name, linkErr)
 			}
+		}
+		if u.cwdOnly {
+			continue
 		}
 		fds, readErr := os.ReadDir(filepath.Join(dir, "fd"))
 		if readErr != nil {
@@ -160,7 +174,11 @@ func (u *processUsage) observationError(dir, subject string, err error) {
 }
 
 func (u *processUsage) observeLsof(ctx context.Context) {
-	command := exec.CommandContext(ctx, "lsof", "-nP", "-u", strconv.Itoa(os.Geteuid()), "-F0pn") // #nosec G204 -- fixed executable; UID is an OS-provided integer and no shell is used.
+	args := []string{"-nP", "-u", strconv.Itoa(os.Geteuid()), "-F0pn"}
+	if u.cwdOnly {
+		args = append(args, "-a", "-d", "cwd")
+	}
+	command := exec.CommandContext(ctx, "lsof", args...) // #nosec G204 -- fixed executable; UID is an OS-provided integer and no shell is used.
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	output, err := command.Output()
@@ -197,6 +215,17 @@ func applyUsage(s *State, usage processUsage) {
 	for _, path := range usage.paths {
 		if beneath(path, s.Path) || beneath(path, s.GitDir) || beneath(path, s.CommonDir) {
 			s.InUse = true
+			return
+		}
+	}
+}
+
+func applyCwdUsage(s *State, usage processUsage) {
+	s.CwdInUseKnown = len(usage.problems) == 0
+	s.CwdProblems = append([]string(nil), usage.problems...)
+	for _, path := range usage.paths {
+		if beneath(path, s.Path) {
+			s.CwdInUse = true
 			return
 		}
 	}

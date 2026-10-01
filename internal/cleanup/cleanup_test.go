@@ -29,11 +29,12 @@ func syntheticState(t *testing.T, root, name string) repository.State {
 		}
 	}
 	return repository.State{Path: path, CommonDir: common, GitDir: gitDir,
-		Head: strings.Repeat("a", 40), Branch: name, Origin: "git@github.com:owner/repo.git", InUseKnown: true}
+		Head: strings.Repeat("a", 40), Branch: name, Origin: "git@github.com:owner/repo.git", InUseKnown: true, CwdInUseKnown: true}
 }
 
 func fixtureEngine(states []repository.State) engine {
 	return engine{
+		options:  Options{Level: Conservative},
 		discover: func(context.Context, string) ([]repository.State, error) { return states, nil },
 		inspect: func(_ context.Context, path string) repository.State {
 			for _, state := range states {
@@ -90,7 +91,8 @@ func TestLocalProtection(t *testing.T) {
 				return nil
 			}
 			results, err := e.run(context.Background(), root, true)
-			if err != nil || len(results) != 1 || results[0].Action != ActionKeep || results[0].Reason == "" {
+			wantErr := test.name == "unknown use" || test.name == "safety problems"
+			if (err != nil) != wantErr || len(results) != 1 || results[0].Action != ActionKeep || results[0].Reason == "" {
 				t.Fatalf("results=%+v err=%v", results, err)
 			}
 		})
@@ -288,9 +290,18 @@ func testGit(t *testing.T, directory string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func realWorktree(t *testing.T) (string, repository.State) {
 	t.Helper()
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	primary := filepath.Join(root, "primary")
 	if err := os.Mkdir(primary, 0o700); err != nil {
 		t.Fatal(err)

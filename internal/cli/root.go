@@ -27,7 +27,7 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "repoman",
 		Short: "Manage local clones and worktrees safely",
-		Long:  `Inventory clones, safely sync active GitHub repositories, and preview conservative worktree cleanup.`,
+		Long:  `Manage configured targets, inventory clones, sync active GitHub repositories, and clean worktrees under configurable policies.`,
 
 		Version:       build.Version,
 		SilenceErrors: true,
@@ -46,6 +46,7 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose (debug) logging")
 
 	root.AddCommand(
+		newConfigCmd(),
 		newStatusCmd(),
 		newSyncCmd(),
 		newCleanCmd(),

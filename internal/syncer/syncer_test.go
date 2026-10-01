@@ -64,12 +64,12 @@ func activeRepo(name string) remoteRepo {
 }
 
 func TestSameOrigin(t *testing.T) {
-	for _, origin := range []string{"https://github.com/alice/project.git", "https://github.com/Alice/Project", "git@github.com:alice/project.git", "ssh://git@github.com/alice/project.git"} {
+	for _, origin := range []string{"https://github.com/alice/project.git", "http://github.com/alice/project.git", "https://github.com/Alice/Project", "git@github.com:alice/project.git", "ssh://git@github.com/alice/project.git"} {
 		if !sameOrigin(origin, "alice/project") {
 			t.Errorf("rejected valid origin %q", origin)
 		}
 	}
-	for _, origin := range []string{"https://github.com.evil/alice/project.git", "https://github.com/bob/project.git", "https://github.com/alice/other.git", "https://user@github.com/alice/project.git", "https://github.com/alice/project.git?x=y", "https://github.com/alice/project.git#x", "https://github.com/alice/project.git/", "https://github.com/alice%2fproject.git", "git://github.com/alice/project.git", "http://github.com/alice/project.git", "ssh://root@github.com/alice/project.git", "ssh://git@github.com:2222/alice/project.git", "/tmp/project.git", "ext::arbitrary command", "https://github.com/alice/project.git\nhttps://github.com/alice/project.git"} {
+	for _, origin := range []string{"https://github.com.evil/alice/project.git", "https://github.com/bob/project.git", "https://github.com/alice/other.git", "https://user@github.com/alice/project.git", "https://github.com/alice/project.git?x=y", "https://github.com/alice/project.git#x", "https://github.com/alice/project.git/", "https://github.com/alice%2fproject.git", "git://github.com/alice/project.git", "http://github.com/bob/project.git", "http://github.com.evil/alice/project.git", "http://user@github.com/alice/project.git", "ssh://root@github.com/alice/project.git", "ssh://git@github.com:2222/alice/project.git", "/tmp/project.git", "ext::arbitrary command", "https://github.com/alice/project.git\nhttps://github.com/alice/project.git"} {
 		if sameOrigin(origin, "alice/project") {
 			t.Errorf("accepted unsafe origin %q", origin)
 		}
@@ -148,7 +148,7 @@ func TestDryRunDoesNotCreateTarget(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(filepath.Dir(dir))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dry run created target parents: %v", err)
 	}
-	if len(calls) != 2 {
+	if len(calls) != 1 {
 		t.Fatalf("unexpected calls %+v", calls)
 	}
 }
@@ -177,7 +177,7 @@ func TestFilters(t *testing.T) {
 	for _, result := range results {
 		reasons[result.Name] = result.Reason
 	}
-	want := map[string]string{"app-one": "active repository", "app-skip": "excluded", "app-archived": "archived", "app-old": "inactive", "app-empty": "no default branch", "other": "not included"}
+	want := map[string]string{"app-one": "active repository", "app-skip": "excluded", "app-archived": "archived", "app-old": "inactive", "app-empty": "active repository", "other": "not included"}
 	if !reflect.DeepEqual(reasons, want) {
 		t.Fatalf("got %v want %v", reasons, want)
 	}
@@ -197,7 +197,6 @@ func TestUnsafePathsAndInput(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "repo", ".git"), []byte("gitdir: elsewhere"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	enabled := true
 	tests := []Target{
 		{Dir: filepath.Join(root, "link", "clones"), Owner: "alice", Days: 45},
 		{Dir: filepath.Join(root, "repo", "clones"), Owner: "alice", Days: 45},
@@ -205,7 +204,6 @@ func TestUnsafePathsAndInput(t *testing.T) {
 		{Dir: root, Owner: "alice", Days: 0},
 		{Dir: root, Owner: "alice", Days: 45, Includes: []string{"["}},
 		{Dir: root, Owner: "alice", Days: 45, Excludes: []string{"../*"}},
-		{Dir: root, Owner: "alice", Days: 45, Events: &enabled},
 		{Dir: "/", Owner: "alice", Days: 45},
 	}
 	e := engine{command: func(context.Context, string, string, ...string) ([]byte, error) {
@@ -244,11 +242,13 @@ func fakeCommands(t *testing.T, dir string, calls *[]call) func(context.Context,
 			return []byte("0\t1\n"), nil
 		case strings.HasPrefix(command, "fetch "):
 			return nil, nil
+		case command == "show-ref --verify --quiet refs/remotes/origin/main":
+			return nil, nil
 		case command == "rev-parse --verify refs/remotes/origin/main^{commit}":
 			return []byte(fetchedOID + "\n"), nil
 		case command == "merge-base --is-ancestor HEAD "+fetchedOID:
 			return nil, nil
-		case command == "-c merge.autostash=false -c branch.main.mergeOptions= merge --ff-only --no-autostash --no-edit --no-overwrite-ignore --quiet -- "+fetchedOID:
+		case command == "-c merge.autostash=false -c branch.main.mergeOptions= merge --ff-only --no-autostash --no-edit --quiet -- "+fetchedOID:
 			return nil, nil
 		default:
 			t.Errorf("unexpected command %s %v", program, args)
@@ -257,20 +257,12 @@ func fakeCommands(t *testing.T, dir string, calls *[]call) func(context.Context,
 	}
 }
 
-func TestUnsafeExistingClonesAreNotFetched(t *testing.T) {
+func TestMismatchedExistingClonesAreNotFetched(t *testing.T) {
 	tests := map[string]func(*repository.State){
-		"dirty":                func(s *repository.State) { s.Dirty = true },
-		"untracked":            func(s *repository.State) { s.Untracked = true },
-		"ignored":              func(s *repository.State) { s.Ignored = true },
-		"locked":               func(s *repository.State) { s.Locked = true },
-		"detached":             func(s *repository.State) { s.Branch = "" },
-		"other branch":         func(s *repository.State) { s.Branch = "feature" },
 		"wrong origin":         func(s *repository.State) { s.Origin = "https://github.com/alice/elsewhere.git" },
-		"unknown":              func(s *repository.State) { s.Problems = []string{"uncertain"} },
 		"inherited repository": func(s *repository.State) { s.Path = filepath.Dir(s.Path) },
-		"linked worktree":      func(s *repository.State) { s.Primary = false },
+		"linked destination":   func(s *repository.State) { s.Primary = false },
 		"external git dir":     func(s *repository.State) { s.GitDir = "/elsewhere" },
-		"unknown head":         func(s *repository.State) { s.Head = "" },
 	}
 	for name, change := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -279,22 +271,51 @@ func TestUnsafeExistingClonesAreNotFetched(t *testing.T) {
 			var calls []call
 			e := engine{command: fakeCommands(t, dir, &calls), inspect: func(context.Context, string) (repository.State, error) { return state, nil }}
 			result, err := e.syncOne(context.Background(), Target{Dir: filepath.Dir(dir)}, activeRepo("project"), false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if result.Action != "skipped" || result.Reason == "" {
-				t.Fatalf("unsafe repository not skipped: %+v", result)
+			if err != nil || result.Action != "skipped" || result.Reason == "" {
+				t.Fatalf("mismatched repository not skipped: %+v, %v", result, err)
 			}
 			for _, c := range calls {
-				if strings.Contains(strings.Join(c.args, " "), "fetch") || strings.Contains(strings.Join(c.args, " "), "merge ") {
-					t.Fatalf("unsafe mutation %+v", c)
+				if c.args[0] == "fetch" || c.args[0] == "-c" {
+					t.Fatalf("identity mismatch mutated: %+v", c)
 				}
 			}
 		})
 	}
 }
 
-func TestAheadDivergedAndUnknownHistoryAreNotFetched(t *testing.T) {
+func TestCheckoutEligibilityDoesNotPreventFetch(t *testing.T) {
+	for name, change := range map[string]func(*repository.State){
+		"dirty":        func(s *repository.State) { s.Dirty = true },
+		"untracked":    func(s *repository.State) { s.Untracked = true },
+		"detached":     func(s *repository.State) { s.Branch = "" },
+		"other branch": func(s *repository.State) { s.Branch = "feature" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir, state := cloneState(t)
+			change(&state)
+			var calls []call
+			e := engine{command: fakeCommands(t, dir, &calls), inspect: func(context.Context, string) (repository.State, error) { return state, nil }}
+			result, err := e.syncOne(context.Background(), Target{Dir: filepath.Dir(dir)}, activeRepo("project"), false)
+			if err != nil || result.Action != "fetched" || !strings.Contains(result.Reason, "fetched only") {
+				t.Fatalf("expected fetch only: %+v, %v", result, err)
+			}
+			fetches := 0
+			for _, c := range calls {
+				if c.args[0] == "fetch" {
+					fetches++
+				}
+				if c.args[0] == "-c" {
+					t.Fatal("updated ineligible checkout")
+				}
+			}
+			if fetches != 1 {
+				t.Fatalf("fetches=%d", fetches)
+			}
+		})
+	}
+}
+
+func TestAheadDivergedAndUnknownHistoryAreFetched(t *testing.T) {
 	for _, history := range []string{"1\t0", "1\t2", "bad", "-1\t0"} {
 		t.Run(history, func(t *testing.T) {
 			dir, state := cloneState(t)
@@ -307,13 +328,21 @@ func TestAheadDivergedAndUnknownHistoryAreNotFetched(t *testing.T) {
 				return base(ctx, wd, program, args...)
 			}}
 			result, err := e.syncOne(context.Background(), Target{Dir: filepath.Dir(dir)}, activeRepo("project"), false)
-			if err != nil || result.Action != "skipped" {
+			unknown := history == "bad" || history == "-1\t0"
+			if (err != nil) != unknown || result.Action != "fetched" {
 				t.Fatalf("got %+v, %v", result, err)
 			}
+			fetches := 0
 			for _, c := range calls {
 				if c.args[0] == "fetch" {
-					t.Fatal("fetched unsafe history")
+					fetches++
 				}
+				if c.args[0] == "-c" {
+					t.Fatal("changed local history")
+				}
+			}
+			if fetches != 1 {
+				t.Fatalf("fetches=%d", fetches)
 			}
 		})
 	}
@@ -334,7 +363,7 @@ func TestDryRunExistingCloneOnlyReads(t *testing.T) {
 	}
 }
 
-func TestOnlyOriginFetchAndFastForward(t *testing.T) {
+func TestOriginFetchWithoutPruneAndFastForward(t *testing.T) {
 	dir, state := cloneState(t)
 	var calls []call
 	e := engine{inspect: func(context.Context, string) (repository.State, error) { return state, nil }, command: fakeCommands(t, dir, &calls)}
@@ -346,7 +375,7 @@ func TestOnlyOriginFetchAndFastForward(t *testing.T) {
 	for _, c := range calls {
 		if c.args[0] == "fetch" {
 			fetches++
-			want := []string{"fetch", "--quiet", "--no-tags", "--no-prune", "--no-prune-tags", "--no-recurse-submodules", "origin", "refs/heads/main:refs/remotes/origin/main"}
+			want := []string{"fetch", "--no-all", "--no-prune", "--no-prune-tags", "--quiet", "origin"}
 			if !reflect.DeepEqual(c.args, want) {
 				t.Fatalf("unsafe fetch %v", c.args)
 			}
@@ -375,7 +404,7 @@ func TestChangesDuringFetchPreventMerge(t *testing.T) {
 		return state, nil
 	}, command: fakeCommands(t, dir, &calls)}
 	result, err := e.syncOne(context.Background(), Target{Dir: filepath.Dir(dir)}, activeRepo("project"), false)
-	if err != nil || result.Action != "skipped" || !strings.Contains(result.Reason, "HEAD changed") {
+	if err != nil || result.Action != "fetched" || !strings.Contains(result.Reason, "HEAD changed") {
 		t.Fatalf("got %+v, %v", result, err)
 	}
 	for _, c := range calls {
@@ -385,9 +414,8 @@ func TestChangesDuringFetchPreventMerge(t *testing.T) {
 	}
 }
 
-func TestLinkedWorktreesAndRewrittenOriginAreSkipped(t *testing.T) {
+func TestRewrittenOriginIsSkipped(t *testing.T) {
 	for name, override := range map[string]map[string]string{
-		"linked":           {"worktree list --porcelain": "worktree /one\n\nworktree /two\n"},
 		"rewritten":        {"remote get-url --all origin": "https://example.com/alice/project.git\n"},
 		"multiple origins": {"remote get-url --all origin": "https://github.com/alice/project.git\nhttps://github.com/alice/project.git\n"},
 	} {
@@ -480,5 +508,20 @@ func TestRunCommandCapturesOutput(t *testing.T) {
 	_, err = runCommand(context.Background(), "", "git", "repoman-nonexistent-command")
 	if err == nil || !strings.Contains(err.Error(), "git:") {
 		t.Fatalf("expected command error, got %v", err)
+	}
+}
+
+func TestLargePositiveActivityWindows(t *testing.T) {
+	old := activeRepo("project")
+	pushed := testNow.AddDate(-80, 0, 0)
+	old.PushedAt = &pushed
+	for _, days := range []int{40000, int(^uint(0) >> 1)} {
+		e := engine{now: func() time.Time { return testNow }, command: func(context.Context, string, string, ...string) ([]byte, error) {
+			return []byte(page(t, []remoteRepo{old}, false, "")), nil
+		}}
+		results, err := e.run(context.Background(), Target{Dir: syncTempDir(t), Owner: "alice", Days: days}, true)
+		if err != nil || len(results) != 1 || results[0].Action != "would-clone" {
+			t.Fatalf("days=%d results=%+v err=%v", days, results, err)
+		}
 	}
 }

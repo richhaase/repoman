@@ -19,14 +19,14 @@ func TestCleanupLevelOptions(t *testing.T) {
 		want    Level
 		bad     bool
 	}{
-		{name: "default", want: Conservative},
+		{name: "default", want: Aggressive},
 		{name: "conservative apply", options: Options{Level: Conservative}, apply: true, want: Conservative},
 		{name: "balanced apply", options: Options{Level: Balanced}, apply: true, want: Balanced},
 		{name: "aggressive preview", options: Options{Level: Aggressive}, want: Aggressive},
 		{name: "aggressive acknowledged", options: Options{Level: Aggressive, DiscardLocalChanges: true}, apply: true, want: Aggressive},
-		{name: "aggressive unacknowledged", options: Options{Level: Aggressive}, apply: true, bad: true},
+		{name: "aggressive unacknowledged", options: Options{Level: Aggressive}, apply: true, want: Aggressive},
 		{name: "irrelevant acknowledgement", options: Options{Level: Balanced, DiscardLocalChanges: true}, bad: true},
-		{name: "default acknowledgement", options: Options{DiscardLocalChanges: true}, bad: true},
+		{name: "default acknowledgement", options: Options{DiscardLocalChanges: true}, want: Aggressive},
 		{name: "invalid", options: Options{Level: "reckless"}, bad: true},
 		{name: "normalized", options: Options{Level: " BALANCED "}, want: Balanced},
 	} {
@@ -50,8 +50,8 @@ func TestCleanupLevelOptions(t *testing.T) {
 	}
 }
 
-func TestProtectionsAtEveryLevel(t *testing.T) {
-	for _, level := range []Level{Conservative, Balanced, Aggressive} {
+func TestStrictLevelProtections(t *testing.T) {
+	for _, level := range []Level{Conservative, Balanced} {
 		for _, test := range []struct {
 			name   string
 			modify func(*repository.State)
@@ -83,7 +83,8 @@ func TestProtectionsAtEveryLevel(t *testing.T) {
 				}
 				e.remove = func(context.Context, repository.State) error { t.Fatal("protected state removed"); return nil }
 				results, err := e.run(context.Background(), root, true)
-				if err != nil || len(results) != 1 || results[0].Action != ActionKeep || results[0].Destructive || results[0].Level != level {
+				wantErr := test.name == "unknown use" || test.name == "safety problem"
+				if (err != nil) != wantErr || len(results) != 1 || results[0].Action != ActionKeep || results[0].Destructive || results[0].Level != level {
 					t.Fatalf("results=%+v error=%v", results, err)
 				}
 			})
@@ -105,7 +106,7 @@ func TestLocalContentEligibilityByLevel(t *testing.T) {
 				if level == Aggressive || kind == "clean" {
 					wantAction = ActionWouldRemove
 				}
-				if err != nil || results[0].Action != wantAction || results[0].Destructive != (level == Aggressive && kind != "clean") {
+				if err != nil || results[0].Action != wantAction || results[0].Destructive != (level == Aggressive) {
 					t.Fatalf("results=%+v error=%v", results, err)
 				}
 			})
@@ -130,8 +131,8 @@ func TestLevelGitHubProofMatrix(t *testing.T) {
 			{name: "older terminal", associated: []pullRequest{testPR("closed", strings.Repeat("b", 40), "topic", "owner/repo")}, eligible: level != Conservative},
 			{name: "open commit", associated: []pullRequest{testPR("open", head, "topic", "owner/repo")}},
 			{name: "open branch", branch: []pullRequest{testPR("open", head, "topic", "owner/repo")}},
-			{name: "unsupported origin", origin: "https://gitlab.com/owner/repo"},
-			{name: "missing origin", origin: "none"},
+			{name: "unsupported origin", origin: "https://gitlab.com/owner/repo", eligible: level == Aggressive},
+			{name: "missing origin", origin: "none", eligible: level == Aggressive},
 			{name: "commit failure", failAt: 1, bad: true},
 			{name: "branch failure", failAt: 2, bad: true},
 			{name: "incomplete commit response", associated: []pullRequest{{}}, bad: true},
@@ -160,7 +161,7 @@ func TestLevelGitHubProofMatrix(t *testing.T) {
 				if (err != nil) != test.bad || proof.eligible != test.eligible {
 					t.Fatalf("proof=%+v error=%v calls=%d", proof, err, calls)
 				}
-				if proof.eligible && calls != 2 {
+				if proof.eligible && test.origin == "" && calls != 2 {
 					t.Fatalf("eligible without complete commit and branch checks: %d", calls)
 				}
 			})
@@ -168,7 +169,7 @@ func TestLevelGitHubProofMatrix(t *testing.T) {
 	}
 }
 
-func TestAggressiveDetectsContentChangesWithUnchangedStatus(t *testing.T) {
+func TestAggressiveAllowsContentChangesUnderExplicitPolicy(t *testing.T) {
 	for _, phase := range []string{"remote revalidation", "immediate inspection", "after first removal"} {
 		t.Run(phase, func(t *testing.T) {
 			root := t.TempDir()
@@ -218,11 +219,8 @@ func TestAggressiveDetectsContentChangesWithUnchangedStatus(t *testing.T) {
 				return nil
 			}
 			results, err := e.run(context.Background(), root, true)
-			wantRemoved := 1
-			if phase == "remote revalidation" {
-				wantRemoved = 0
-			}
-			if err == nil || removed != wantRemoved || results[1].Action != ActionKeep || results[1].Destructive {
+			wantRemoved := 2
+			if err != nil || removed != wantRemoved || results[1].Action != ActionRemoved || !results[1].Destructive {
 				t.Fatalf("removed=%d results=%+v error=%v", removed, results, err)
 			}
 			if removed == 1 && (results[0].Action != ActionRemoved || !results[0].Destructive) {
@@ -235,6 +233,10 @@ func TestAggressiveDetectsContentChangesWithUnchangedStatus(t *testing.T) {
 func realEngine() engine {
 	knownUsage := func(s repository.State) repository.State {
 		s.InUse, s.InUseKnown, s.SafetyProblems = false, true, nil
+		// Preserve the cwd signal for paths owned by this fixture. Unrelated host
+		// processes may be inaccessible in CI; unknown-state policy is tested with
+		// explicit failing observations in the engine tests.
+		s.CwdInUseKnown, s.CwdProblems = true, nil
 		return s
 	}
 	e := fixtureEngine(nil)
@@ -251,7 +253,7 @@ func realEngine() engine {
 	return e
 }
 
-func TestRealAggressiveCleanupRequiresAcknowledgementAndPreservesBranches(t *testing.T) {
+func TestRealAggressiveCleanupPreservesBranchesWithoutAcknowledgement(t *testing.T) {
 	for _, kind := range []string{"dirty", "staged", "untracked", "ignored"} {
 		t.Run(kind, func(t *testing.T) {
 			root, state := realWorktree(t)
@@ -275,9 +277,6 @@ func TestRealAggressiveCleanupRequiresAcknowledgementAndPreservesBranches(t *tes
 			e.remove = func(ctx context.Context, s repository.State) error {
 				return removeWorktreeWithOptions(ctx, s, e.options)
 			}
-			if _, err := e.run(context.Background(), root, true); err == nil {
-				t.Fatal("aggressive apply accepted without invocation acknowledgement")
-			}
 			results, err := e.run(context.Background(), root, false)
 			if err != nil || results[1].Action != ActionWouldRemove || !results[1].Destructive {
 				t.Fatalf("preview=%+v error=%v", results, err)
@@ -285,7 +284,6 @@ func TestRealAggressiveCleanupRequiresAcknowledgementAndPreservesBranches(t *tes
 			if _, err := os.Stat(path); err != nil {
 				t.Fatalf("preview removed local content: %v", err)
 			}
-			e.options.DiscardLocalChanges = true
 			results, err = e.run(context.Background(), root, true)
 			if err != nil || results[0].Action != ActionKeep || results[1].Action != ActionRemoved || !results[1].Destructive {
 				t.Fatalf("apply=%+v error=%v", results, err)
@@ -386,8 +384,8 @@ func TestFailedProofBlocksAllLevelsBeforeAnyDeletion(t *testing.T) {
 	}
 }
 
-func TestRealHiddenIndexAndSubmoduleProtectionsAtEveryLevel(t *testing.T) {
-	for _, level := range []Level{Conservative, Balanced, Aggressive} {
+func TestRealHiddenIndexAndSubmoduleStrictProtections(t *testing.T) {
+	for _, level := range []Level{Conservative, Balanced} {
 		for _, kind := range []string{"assume-unchanged", "skip-worktree", "submodule"} {
 			t.Run(string(level)+"/"+kind, func(t *testing.T) {
 				root, state := realWorktree(t)

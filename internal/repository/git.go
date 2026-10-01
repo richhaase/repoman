@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -42,9 +43,9 @@ func gitLine(ctx context.Context, path string, args ...string) (string, error) {
 	return strings.TrimSuffix(string(output), "\n"), err
 }
 
-func exitCode(err error, code int) bool {
+func exitOne(err error) bool {
 	var exit *exec.ExitError
-	return errors.As(err, &exit) && exit.ExitCode() == code
+	return errors.As(err, &exit) && exit.ExitCode() == 1
 }
 
 func inspectStatus(ctx context.Context, s *State) {
@@ -173,6 +174,8 @@ func inspectRefs(ctx context.Context, s *State) {
 }
 
 type worktree struct {
+	head     string
+	branch   string
 	path     string
 	locked   bool
 	prunable bool
@@ -220,7 +223,11 @@ func parseWorktrees(output []byte) ([]worktree, error) {
 			current.locked = true
 		case field == "prunable" || strings.HasPrefix(field, "prunable "):
 			current.prunable = true
-		case field == "bare", field == "detached", strings.HasPrefix(field, "HEAD "), strings.HasPrefix(field, "branch "):
+		case strings.HasPrefix(field, "HEAD "):
+			current.head = strings.TrimPrefix(field, "HEAD ")
+		case strings.HasPrefix(field, "branch "):
+			current.branch = strings.TrimPrefix(field, "branch refs/heads/")
+		case field == "bare", field == "detached":
 			// Git metadata that is not needed for path discovery.
 		default:
 			return nil, fmt.Errorf("unrecognized worktree metadata %q", field)
@@ -276,5 +283,34 @@ func operationMarker(name string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+var prReference = regexp.MustCompile(`(?:^|/)pr/([0-9]+)$`)
+
+func inspectPRRefs(ctx context.Context, s *State) {
+	if s.Head == "" {
+		return
+	}
+	output, err := gitLine(ctx, s.Path, "for-each-ref", "--contains", s.Head, "--format=%(refname)")
+	if err != nil {
+		s.identityProblem("read PR reference associations: %v", err)
+		return
+	}
+	seen := make(map[int]bool)
+	for _, ref := range strings.Split(output, "\n") {
+		match := prReference.FindStringSubmatch(ref)
+		if len(match) == 0 {
+			continue
+		}
+		number, err := strconv.Atoi(match[1])
+		if err != nil || number <= 0 {
+			s.identityProblem("invalid PR reference number: %q", ref)
+			continue
+		}
+		if !seen[number] {
+			s.PRNumbers = append(s.PRNumbers, number)
+			seen[number] = true
+		}
 	}
 }

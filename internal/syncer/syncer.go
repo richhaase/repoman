@@ -1,5 +1,5 @@
-// Package syncer conservatively clones and fast-forwards active GitHub repositories.
-// It never resets, forces a checkout, deletes a repository, or pushes a ref.
+// Package syncer clones and updates active GitHub repositories, with explicit
+// options for forced default-branch checkout and inactive-clone cleanup.
 package syncer
 
 import (
@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,12 +19,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/richhaase/repoman/internal/repopattern"
 	"github.com/richhaase/repoman/internal/repository"
 )
 
 // Target identifies a GitHub owner and the parent directory for its clones.
-// Includes and Excludes match repository names using path.Match globs.
-// Event-based activity is deliberately unsupported; nil or false means pushes only.
+// Includes and Excludes match repository names using repository-name globs.
+// Activity is push-based. Legacy Events values are accepted for config compatibility.
 type Target struct {
 	Dir          string   `json:"dir"`
 	Owner        string   `json:"owner"`
@@ -34,6 +34,8 @@ type Target struct {
 	Excludes     []string `json:"excludes,omitempty"`
 	Events       *bool    `json:"events,omitempty"`
 	CleanupLevel string   `json:"cleanup_level,omitempty"`
+	FetchScope   string   `json:"fetch_scope,omitempty"`
+	Prune        bool     `json:"prune,omitempty"`
 }
 
 // Result records either a completed action, a dry-run plan, or a reason for skipping.
@@ -65,15 +67,46 @@ type engine struct {
 // Per-repository failures are returned both as results and a joined error.
 // Dry runs never create directories, fetch, clone, merge, or write Git metadata.
 func Run(ctx context.Context, target Target, dryRun bool) ([]Result, error) {
-	return (&engine{command: runCommand, inspect: func(ctx context.Context, path string) (repository.State, error) {
-		return repository.Inspect(ctx, path), nil
-	}, now: time.Now}).run(ctx, target, dryRun)
+	return RunWithOptions(ctx, target, Options{DryRun: dryRun})
 }
 
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}$`)
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
+// Options controls this invocation. Empty FetchScope and nil Prune use the
+// target's settings. Force and Cleanup are never saved on a target.
+type Options struct {
+	DryRun     bool
+	Force      bool
+	Cleanup    bool
+	FetchScope string
+	Prune      *bool
+}
+
+// RunWithOptions runs sync with fetch, force, and cleanup choices. DryRun
+// previews all actions without writing the filesystem or Git metadata.
+func RunWithOptions(ctx context.Context, target Target, options Options) ([]Result, error) {
+	return (&engine{command: runCommand, now: time.Now}).runWithOptions(ctx, target, options)
+}
+
 func (e *engine) run(ctx context.Context, target Target, dryRun bool) ([]Result, error) {
+	return e.runWithOptions(ctx, target, Options{DryRun: dryRun})
+}
+
+func (e *engine) runWithOptions(ctx context.Context, target Target, options Options) ([]Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, _, err := fetchOptions(target, options); err != nil {
+		return nil, err
+	}
+	if target.Owner == "" {
+		owner, err := e.authenticatedOwner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		target.Owner = owner
+	}
 	if err := validateTarget(&target); err != nil {
 		return nil, err
 	}
@@ -86,12 +119,19 @@ func (e *engine) run(ctx context.Context, target Target, dryRun bool) ([]Result,
 	}
 	results := make([]Result, 0, len(repos))
 	var failures []error
-	cutoff := e.now().UTC().AddDate(0, 0, -target.Days)
+	now := e.now().UTC()
+	// GitHub JSON timestamps have four-digit, non-negative years. Saturating
+	// windows older than that range avoids integer overflow for huge day counts.
+	cutoff := time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)
+	if target.Days <= 366*(now.Year()+1) {
+		cutoff = now.AddDate(0, 0, -target.Days)
+	}
 	for _, repo := range repos {
 		if err := ctx.Err(); err != nil {
 			return results, errors.Join(append(failures, err)...)
 		}
 		result := Result{Name: repo.Name, Path: filepath.Join(target.Dir, repo.Name), Action: "skipped"}
+		var actionErr error
 		switch {
 		case !matches(target.Includes, repo.Name, true):
 			result.Reason = "not included"
@@ -99,17 +139,18 @@ func (e *engine) run(ctx context.Context, target Target, dryRun bool) ([]Result,
 			result.Reason = "excluded"
 		case repo.Archived:
 			result.Reason = "archived"
-		case repo.PushedAt == nil || repo.PushedAt.Before(cutoff):
+		case repo.PushedAt == nil || !repo.PushedAt.After(cutoff):
 			result.Reason = "inactive"
-		case repo.DefaultBranch == nil || repo.DefaultBranch.Name == "":
-			result.Reason = "no default branch"
-		default:
-			result, err = e.syncOne(ctx, target, repo, dryRun)
-			if err != nil {
-				result.Action = "error"
-				result.Reason = err.Error()
-				failures = append(failures, fmt.Errorf("%s: %w", repo.Name, err))
+			if options.Cleanup {
+				result, actionErr = e.cleanupOne(ctx, target, repo, options.DryRun)
 			}
+		default:
+			result, actionErr = e.syncOneWithOptions(ctx, target, repo, options)
+		}
+		if actionErr != nil {
+			result.Action = "error"
+			result.Reason = actionErr.Error()
+			failures = append(failures, fmt.Errorf("%s: %w", repo.Name, actionErr))
 		}
 		results = append(results, result)
 	}
@@ -120,11 +161,8 @@ func validateTarget(target *Target) error {
 	if !ownerPattern.MatchString(target.Owner) {
 		return errors.New("owner must be a GitHub user or organization login")
 	}
-	if target.Days < 1 || target.Days > 36500 {
-		return errors.New("activity days must be between 1 and 36500")
-	}
-	if target.Events != nil && *target.Events {
-		return errors.New("event-based activity is unsupported; choose push-only activity (events=false or --no-events)")
+	if target.Days < 1 {
+		return errors.New("activity days must be positive")
 	}
 	if strings.TrimSpace(target.Dir) == "" || strings.ContainsAny(target.Dir, "\x00\r\n") {
 		return errors.New("target directory must be a non-empty single-line path")
@@ -141,7 +179,7 @@ func validateTarget(target *Target) error {
 		if pattern == "" || strings.ContainsAny(pattern, "\x00\r\n/") {
 			return fmt.Errorf("invalid repository pattern %q", pattern)
 		}
-		if _, err := path.Match(pattern, ""); err != nil {
+		if _, err := repopattern.Match(pattern, ""); err != nil {
 			return fmt.Errorf("invalid repository pattern %q: %w", pattern, err)
 		}
 	}
@@ -157,7 +195,7 @@ func matches(patterns []string, name string, empty bool) bool {
 		return empty
 	}
 	for _, pattern := range patterns {
-		if matched, _ := path.Match(pattern, name); matched {
+		if matched, _ := repopattern.Match(pattern, name); matched {
 			return true
 		}
 	}
@@ -239,22 +277,21 @@ func (e *engine) list(ctx context.Context, owner string) ([]remoteRepo, error) {
 }
 
 func (e *engine) syncOne(ctx context.Context, target Target, repo remoteRepo, dryRun bool) (Result, error) {
+	return e.syncOneWithOptions(ctx, target, repo, Options{DryRun: dryRun})
+}
+
+func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo remoteRepo, options Options) (Result, error) {
 	result := Result{Name: repo.Name, Path: filepath.Join(target.Dir, repo.Name), Action: "skipped"}
-	branch := repo.DefaultBranch.Name
-	if branch == "HEAD" {
-		result.Reason = "unsafe default branch"
-		return result, nil
-	}
-	if _, err := e.command(ctx, "", "git", "check-ref-format", "refs/heads/"+branch); err != nil {
-		result.Reason = "invalid or unverifiable default branch"
-		return result, nil
+	scope, prune, err := fetchOptions(target, options)
+	if err != nil {
+		return result, err
 	}
 	if err := checkRoot(target.Dir); err != nil {
 		return result, err
 	}
 	info, err := os.Lstat(result.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		if dryRun {
+		if options.DryRun {
 			result.Action = "would-clone"
 			result.Reason = "active repository"
 			return result, nil
@@ -265,7 +302,6 @@ func (e *engine) syncOne(ctx context.Context, target Target, repo remoteRepo, dr
 		if err := checkRoot(target.Dir); err != nil {
 			return result, err
 		}
-		// Do not let git clone reuse even an empty destination supplied by someone else.
 		if _, err := os.Lstat(result.Path); !errors.Is(err, os.ErrNotExist) {
 			return result, errors.New("destination appeared before cloning; left untouched")
 		}
@@ -283,144 +319,187 @@ func (e *engine) syncOne(ctx context.Context, target Target, repo remoteRepo, dr
 		result.Reason = "destination is not a real directory"
 		return result, nil
 	}
-	state, reason := e.safeState(ctx, result.Path, repo, branch)
-	if reason != "" {
+	state, reason, err := e.primaryState(ctx, result.Path, repo)
+	if err != nil || reason != "" {
 		result.Reason = reason
-		return result, nil
-	}
-	ref := "refs/remotes/origin/" + branch
-	ahead, behind, err := e.distance(ctx, result.Path, ref)
-	if err != nil {
-		result.Reason = "cannot verify local history against origin default branch"
-		return result, nil
-	}
-	if ahead > 0 {
-		result.Reason = historyReason(ahead, behind)
-		return result, nil
-	}
-	if dryRun {
-		result.Action = "would-sync"
-		result.Reason = "would fetch origin and fast-forward if still safe; remote freshness is unknown"
-		return result, nil
-	}
-	if err := checkRoot(target.Dir); err != nil {
 		return result, err
 	}
-	// Explicit refspecs avoid trusting a local remote's configured fetch targets.
-	// No pruning, forced ref update, tags, submodules, or other remotes are involved.
-	_, err = e.command(ctx, result.Path, "git", "fetch", "--quiet", "--no-tags", "--no-prune", "--no-prune-tags", "--no-recurse-submodules", "origin", "refs/heads/"+branch+":"+ref)
-	if err != nil {
-		return result, fmt.Errorf("fetch origin failed: %w", err)
+	branch := ""
+	if repo.DefaultBranch != nil {
+		branch = repo.DefaultBranch.Name
 	}
-	after, reason := e.safeState(ctx, result.Path, repo, branch)
-	if reason != "" {
+	if options.DryRun {
+		result.Action = "would-fetch"
+		fetch := "would fetch " + fetchDescription(scope, prune)
+		result.Reason = fetch + "; " + checkoutReason(state, branch)
+		if len(state.Problems) > 0 {
+			return result, fmt.Errorf("inspect checkout: %s", strings.Join(state.Problems, "; "))
+		}
+		if branch != "" && options.Force {
+			result.Action = "would-force"
+			result.Reason = fetch + ", then force " + branch + " to origin/" + branch + "; local changes and default-branch commits may be discarded"
+		} else if checkoutReason(state, branch) == "" {
+			result.Action = "would-sync"
+			result.Reason = fetch + ", then fast-forward if possible; remote freshness is unknown"
+		}
+		return result, nil
+	}
+	// Fetch is independent of checkout eligibility: dirty, detached, non-default,
+	// ahead and diverged clones still refresh the selected remotes. Explicit
+	// --no-prune overrides both fetch.prune and remote.<name>.prune config.
+	if _, err := e.command(ctx, result.Path, "git", fetchArgs(scope, prune)...); err != nil {
+		return result, fmt.Errorf("fetch %s failed: %w", fetchDescription(scope, prune), err)
+	}
+	result.Action = "fetched"
+	after, reason, err := e.primaryState(ctx, result.Path, repo)
+	if err != nil || reason != "" {
 		result.Reason = "after fetch: " + reason
+		return result, err
+	}
+	if len(after.Problems) > 0 {
+		return result, fmt.Errorf("inspect checkout after fetch: %s", strings.Join(after.Problems, "; "))
+	}
+	if !options.Force {
+		if reason := checkoutReason(after, branch); reason != "" {
+			result.Reason = reason + "; fetched only"
+			return result, nil
+		}
+		if after.Head != state.Head || after.Branch != state.Branch {
+			result.Reason = "HEAD changed while fetching; fetched only"
+			return result, nil
+		}
+	}
+	if branch == "" {
+		result.Reason = "no default branch; fetched only"
 		return result, nil
 	}
-	if after.Head != state.Head {
-		result.Reason = "HEAD changed while fetching"
-		return result, nil
+	if branch == "HEAD" {
+		return result, errors.New("unsafe default branch")
 	}
-	ahead, behind, err = e.distance(ctx, result.Path, ref)
+	if _, err := e.command(ctx, "", "git", "check-ref-format", "refs/heads/"+branch); err != nil {
+		return result, fmt.Errorf("invalid or unverifiable default branch: %w", err)
+	}
+	ref := "refs/remotes/origin/" + branch
+	if _, err := e.command(ctx, result.Path, "git", "show-ref", "--verify", "--quiet", ref); err != nil {
+		if commandExitOne(err) {
+			result.Reason = "no origin/" + branch + "; fetched only"
+			return result, nil
+		}
+		return result, fmt.Errorf("check fetched default branch: %w", err)
+	}
+	commit, err := e.command(ctx, result.Path, "git", "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
-		result.Reason = "cannot verify fetched default branch"
+		return result, fmt.Errorf("resolve fetched default branch: %w", err)
+	}
+	oid := strings.TrimSpace(string(commit))
+	if !validOID(oid) {
+		return result, errors.New("fetched commit has an invalid object ID")
+	}
+	if options.Force {
+		if after.Head == oid && after.Branch == branch && !after.Dirty && !after.Untracked {
+			result.Action = "up-to-date"
+			return result, nil
+		}
+		if _, err := e.command(ctx, result.Path, "git", "checkout", "-q", "-f", "-B", branch, ref); err != nil {
+			return result, fmt.Errorf("force checkout failed: %w", err)
+		}
+		result.Action = "forced"
+		result.Reason = "checked out " + branch + " at origin/" + branch
 		return result, nil
+	}
+	ahead, behind, err := e.distance(ctx, result.Path, oid)
+	if err != nil {
+		return result, fmt.Errorf("compare fetched default branch: %w", err)
 	}
 	if ahead > 0 {
-		result.Reason = historyReason(ahead, behind)
+		result.Reason = historyReason(ahead, behind) + "; fetched only"
 		return result, nil
 	}
 	if behind == 0 {
 		result.Action = "up-to-date"
 		return result, nil
 	}
-	// Resolve to an immutable commit so a concurrent fetch cannot change what is merged.
-	commit, err := e.command(ctx, result.Path, "git", "rev-parse", "--verify", ref+"^{commit}")
-	if err != nil {
-		return result, fmt.Errorf("resolve fetched commit: %w", err)
-	}
-	oid := strings.TrimSpace(string(commit))
-	if !validOID(oid) {
-		return result, errors.New("fetched commit has an invalid object ID")
-	}
-	if _, err := e.command(ctx, result.Path, "git", "merge-base", "--is-ancestor", "HEAD", oid); err != nil {
-		result.Reason = "fetched history is not a verified fast-forward"
-		return result, nil
-	}
-	latest, reason := e.safeState(ctx, result.Path, repo, branch)
-	if reason != "" {
+	latest, reason, err := e.primaryState(ctx, result.Path, repo)
+	if err != nil || reason != "" {
 		result.Reason = "before fast-forward: " + reason
+		return result, err
+	}
+	if len(latest.Problems) > 0 {
+		return result, fmt.Errorf("inspect checkout before fast-forward: %s", strings.Join(latest.Problems, "; "))
+	}
+	if reason := checkoutReason(latest, branch); reason != "" {
+		result.Reason = reason + "; fetched only"
 		return result, nil
 	}
-	if latest.Head != state.Head {
-		result.Reason = "HEAD changed before fast-forward"
+	if latest.Head != after.Head {
+		result.Reason = "HEAD changed before fast-forward; fetched only"
 		return result, nil
 	}
-	_, err = e.command(ctx, result.Path, "git", "-c", "merge.autostash=false", "-c", "branch."+branch+".mergeOptions=", "merge", "--ff-only", "--no-autostash", "--no-edit", "--no-overwrite-ignore", "--quiet", "--", oid)
+	_, err = e.command(ctx, result.Path, "git", "-c", "merge.autostash=false", "-c", "branch."+branch+".mergeOptions=", "merge", "--ff-only", "--no-autostash", "--no-edit", "--quiet", "--", oid)
 	if err != nil {
-		return result, fmt.Errorf("fast-forward failed; no reset or cleanup attempted: %w", err)
+		return result, fmt.Errorf("fast-forward failed: %w", err)
 	}
 	result.Action = "updated"
 	result.Reason = "fast-forwarded " + branch
 	return result, nil
 }
 
-func (e *engine) safeState(ctx context.Context, dir string, repo remoteRepo, branch string) (repository.State, string) {
+func checkoutReason(state repository.State, branch string) string {
+	if state.Dirty || state.Untracked {
+		return "working tree has uncommitted or untracked changes"
+	}
+	if branch == "" {
+		return "no default branch"
+	}
+	if state.Branch == "" {
+		return "detached HEAD"
+	}
+	if state.Branch != branch {
+		return "current branch is not the GitHub default branch"
+	}
+	if !validOID(state.Head) {
+		return "HEAD cannot be verified"
+	}
+	return ""
+}
+
+// primaryState establishes identity, not checkout eligibility. General inventory
+// and worktree-cleanup policy do not decide whether a clone can fetch or sync.
+func (e *engine) primaryState(ctx context.Context, dir string, repo remoteRepo) (repository.State, string, error) {
 	var empty repository.State
 	if err := checkPath(dir); err != nil {
-		return empty, err.Error()
+		return empty, "", err
 	}
 	gitDir := filepath.Join(dir, ".git")
 	info, err := os.Lstat(gitDir)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return empty, "destination is not a primary clone with a real .git directory"
+	if errors.Is(err, os.ErrNotExist) || (err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0)) {
+		return empty, "destination is not a primary clone with a real .git directory", nil
 	}
-	state, err := e.inspect(ctx, dir)
 	if err != nil {
-		return state, "repository inspection failed: " + err.Error()
+		return empty, "", fmt.Errorf("inspect Git directory: %w", err)
+	}
+	inspect := e.inspect
+	if inspect == nil {
+		inspect = e.inspectClone
+	}
+	state, err := inspect(ctx, dir)
+	if err != nil {
+		return state, "", fmt.Errorf("repository inspection failed: %w", err)
 	}
 	if !state.Primary || filepath.Clean(state.Path) != dir || filepath.Clean(state.GitDir) != gitDir || filepath.Clean(state.CommonDir) != gitDir {
-		return state, "destination is not the exact top-level primary clone"
-	}
-	if len(state.Problems) > 0 {
-		return state, "repository state is uncertain: " + strings.Join(state.Problems, "; ")
-	}
-	if state.Locked {
-		return state, "repository is locked or has an operation in progress"
-	}
-	if state.Dirty || state.Untracked || state.Ignored {
-		return state, "working tree has changed, untracked, or ignored files"
-	}
-	if state.Branch == "" {
-		return state, "detached HEAD"
-	}
-	if state.Branch != branch {
-		return state, "current branch is not the GitHub default branch"
-	}
-	if !validOID(state.Head) {
-		return state, "HEAD cannot be verified"
+		return state, "destination is not the exact top-level primary clone", nil
 	}
 	if !sameOrigin(state.Origin, repo.FullName) {
-		return state, "origin does not match the requested GitHub repository"
+		return state, "origin does not match the requested GitHub repository", nil
 	}
 	urls, err := e.command(ctx, dir, "git", "remote", "get-url", "--all", "origin")
-	if err != nil || !sameOrigin(strings.TrimSpace(string(urls)), repo.FullName) {
-		return state, "effective origin is missing, ambiguous, or does not match GitHub"
-	}
-	trees, err := e.command(ctx, dir, "git", "worktree", "list", "--porcelain")
 	if err != nil {
-		return state, "cannot verify linked worktrees"
+		return state, "", fmt.Errorf("read effective origin: %w", err)
 	}
-	count := 0
-	for _, line := range strings.Split(string(trees), "\n") {
-		if strings.HasPrefix(line, "worktree ") {
-			count++
-		}
+	if !sameOrigin(strings.TrimSpace(string(urls)), repo.FullName) {
+		return state, "effective origin is ambiguous or does not match GitHub", nil
 	}
-	if count != 1 {
-		return state, "repository has linked worktrees or uncertain worktree metadata"
-	}
-	return state, ""
+	return state, "", nil
 }
 
 func (e *engine) distance(ctx context.Context, dir, ref string) (int, int, error) {
@@ -475,7 +554,7 @@ func sameOrigin(origin, fullName string) bool {
 			return false
 		}
 		switch parsed.Scheme {
-		case "https":
+		case "https", "http":
 			if parsed.User != nil {
 				return false
 			}

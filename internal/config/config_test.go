@@ -24,8 +24,18 @@ func TestLoad(t *testing.T) {
 		{"negative", `{"targets":[{"dir":"/tmp","days":-1}]}`, true},
 		{"cleanup level", `{"targets":[{"dir":"/tmp","cleanup_level":"aggressive"}]}`, false},
 		{"invalid cleanup level", `{"targets":[{"dir":"/tmp","cleanup_level":"reckless"}]}`, true},
+		{"origin fetch", `{"targets":[{"dir":"/tmp","fetch_scope":"origin"}]}`, false},
+		{"all fetch and prune", `{"targets":[{"dir":"/tmp","fetch_scope":"all","prune":true}]}`, false},
+		{"no prune", `{"targets":[{"dir":"/tmp","prune":false}]}`, false},
+		{"invalid fetch scope", `{"targets":[{"dir":"/tmp","fetch_scope":"everywhere"}]}`, true},
+		{"whitespace fetch scope", `{"targets":[{"dir":"/tmp","fetch_scope":" "}]}`, true},
+		{"cannot persist force", `{"targets":[{"dir":"/tmp","force":true}]}`, true},
+		{"cannot persist primary eviction", `{"targets":[{"dir":"/tmp","cleanup":true}]}`, true},
 		{"cannot persist discard", `{"targets":[{"dir":"/tmp","cleanup_level":"aggressive","discard_local_changes":true}]}`, true},
 		{"pattern", `{"targets":[{"dir":"/tmp","includes":["["]}]}`, true},
+		{"NUL directory", `{"targets":[{"dir":"/tmp/bad\u0000dir"}]}`, true},
+		{"newline directory", `{"targets":[{"dir":"/tmp/bad\ndir"}]}`, true},
+		{"carriage return directory", `{"targets":[{"dir":"/tmp/bad\rdir"}]}`, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "config.json")
