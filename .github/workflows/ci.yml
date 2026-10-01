@@ -115,6 +115,10 @@ jobs:
           version: v2.18.2
           args: check
       - name: Build local snapshot without signing or publishing
-        run: goreleaser release --snapshot --clean --skip=publish
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: release --snapshot --clean --skip=publish
       - name: Verify cask and release archives
         run: python3 scripts/verify-snapshot.py
