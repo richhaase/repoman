@@ -94,3 +94,27 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: go build -v -o repoman-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/repoman
+
+  release-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test release preconditions without credentials
+        run: python3 scripts/test_release_preconditions.py
+      - name: Validate pinned GoReleaser configuration
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: check
+      - name: Build local snapshot without signing or publishing
+        run: goreleaser release --snapshot --clean --skip=publish
+      - name: Verify cask and release archives
+        run: python3 scripts/verify-snapshot.py

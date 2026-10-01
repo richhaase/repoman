@@ -2,11 +2,13 @@ version: 2
 
 before:
   hooks:
+    - '{{ if .IsSnapshot }}true{{ else }}bash scripts/check-live-release.sh{{ end }}'
     - go mod tidy
     - go test ./...
 
 builds:
-  - main: ./cmd/repoman
+  - id: repoman
+    main: ./cmd/repoman
     binary: repoman
     env:
       - CGO_ENABLED=0
@@ -23,16 +25,17 @@ builds:
       - -X main.date={{.Date}}
 
 archives:
-  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: repoman-archive
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats:
       - tar.gz
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
+    files:
+      - README.md
+      - LICENSE
 
 checksum:
   name_template: checksums.txt
+  algorithm: sha256
 
 changelog:
   sort: asc
@@ -54,3 +57,40 @@ release:
   prerelease: auto
   name_template: "{{.ProjectName}} v{{.Version}}"
 
+
+# Direct publishing follows the existing Bigboard/Plonk/ACR release pattern.
+# The release workflow blocks this path unless the source repo is public.
+homebrew_casks:
+  - name: repoman
+    repository:
+      owner: richhaase
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/richhaase/repoman"
+    description: "Manage local Git clones and worktrees safely"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Cask update for {{ .ProjectName }} version {{ .Tag }}"
+    skip_upload: auto
+    dependencies:
+      - formula: git
+      - formula: gh
+
+notarize:
+  macos:
+    - enabled: '{{ and (not .IsSnapshot) (isEnvSet "QUILL_SIGN_P12") }}'
+      ids:
+        - repoman
+      sign:
+        certificate: "{{ .Env.QUILL_SIGN_P12 }}"
+        password: "{{ .Env.QUILL_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.QUILL_NOTARY_ISSUER }}"
+        key_id: "{{ .Env.QUILL_NOTARY_KEY_ID }}"
+        key: "{{ .Env.QUILL_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
+
+announce:
+  skip: true

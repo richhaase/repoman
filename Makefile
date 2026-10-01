@@ -1,4 +1,4 @@
-.PHONY: help build install run test test-coverage fmt fmt-check vet lint vuln check release-snapshot clean deps deps-list deps-update generate
+.PHONY: help build install run test test-coverage fmt fmt-check vet lint vuln check release-check release-snapshot clean deps deps-list deps-update generate
 
 BINARY := repoman
 CMD_PATH := ./cmd/repoman
@@ -19,6 +19,7 @@ help:
 	@echo "  lint             - Run golangci-lint (pinned version)"
 	@echo "  vuln             - Scan dependencies for known vulnerabilities"
 	@echo "  check            - Run all quality checks (fmt-check, vet, lint, test) — non-mutating"
+	@echo "  release-check    - Test release safeguards and validate GoReleaser config"
 	@echo "  release-snapshot - Verify GoReleaser config with a local snapshot build (no publish)"
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Tidy and verify modules"
@@ -80,8 +81,13 @@ vuln:
 
 check: fmt-check vet lint test
 
-release-snapshot:
-	@goreleaser release --snapshot --clean
+release-check:
+	@python3 scripts/test_release_preconditions.py
+	@goreleaser check
+
+release-snapshot: release-check
+	@goreleaser release --snapshot --clean --skip=publish
+	@python3 scripts/verify-snapshot.py
 
 clean:
 	@rm -rf $(BIN_DIR) dist coverage.out coverage.html
