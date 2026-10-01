@@ -215,8 +215,12 @@ match is distinct from a failed lookup. Non-GitHub repositories have no GitHub
 PR evidence and remain eligible under the default policy.
 
 The complete selected batch is inventoried and checked before any removal.
-Inventory, identity, required process-observation, or GitHub lookup failures abort
-that batch. Registration identity, locks, and cwd use are checked again before
+Inventory, identity, or GitHub lookup failures abort that batch. Default
+aggressive cleanup checks process use on a best-effort basis, matching the
+original script: observed cwd matches are retained, while incomplete visibility
+produces a stderr warning and JSON warnings instead of stopping all cleanup.
+Unobserved processes may still use eligible worktrees. Balanced/conservative
+require complete process observation and abort when it is unavailable. Registration identity, locks, and cwd use are checked again before
 removing each candidate. Stale registrations are reported and pruned using Git's
 normal expiry rules. If another stale registration in the same repository is
 protected, bulk pruning is deferred so it cannot remove that registration. An
@@ -241,8 +245,10 @@ unavailable. Non-repository directories are not recursively scanned.
 Status/sync/clean emit one JSON object with `schema_version: 1`, `command`,
 `dry_run`, `items` (always an array), and `errors` (always an array). Human and JSON
 renderers consume the same results. Cleanup also reports effective policies for
-every selected root, including empty roots, and per-item destructive indicators.
-Check actions and `dry_run` to distinguish plans from completed mutations.
+every selected root, including empty roots, and per-item destructive indicators. Non-empty `warnings` arrays
+report incomplete best-effort process visibility on cleanup items and the command
+envelope. Each state reflects its latest observation; warnings can also reflect
+incomplete earlier checks. Check actions and `dry_run` to distinguish plans from completed mutations.
 
 - `0`: completed; intentional skips may remain
 - `1`: command/usage/runtime failure before a complete report

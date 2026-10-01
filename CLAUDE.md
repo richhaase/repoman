@@ -152,9 +152,12 @@ stdlib paths. Bump it to a current patch release; do not round it down.
 - Cleanup follows exact worktree registrations, including paths outside the
   selected parent. Preserve branch refs. Never double-force an explicit lock or
   replace Git worktree removal with a shell delete fallback.
-- Required identity, process observation, and PR lookup errors are distinct from
-  no evidence of in-flight work. Preflight all selected targets before cleanup
-  mutations, recheck each candidate, and report partial failure honestly.
+- Identity and PR lookup errors are distinct from no evidence of in-flight work.
+  Default aggressive process observation is best effort, with visible stderr/JSON
+  warnings for incomplete visibility and every observed cwd match protected.
+  Strict levels fail closed on incomplete process observation. Preflight all
+  selected targets before mutations, recheck candidates, and report partial
+  failure honestly.
 - Process observation for default cleanup covers the current OS user's cwd, not
   every open file or shared Git directory. A used primary does not protect an
   unrelated linked worktree.

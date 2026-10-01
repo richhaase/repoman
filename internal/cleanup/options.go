@@ -6,7 +6,8 @@ import (
 )
 
 // Level controls which worktrees qualify for cleanup.
-// Required identity, process and PR observation failures block every level.
+// Identity and PR failures block every level. Strict levels also require
+// complete process visibility; aggressive keeps observed cwd matches and warns.
 type Level string
 
 const (

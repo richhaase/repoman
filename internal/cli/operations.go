@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ type envelope struct {
 	DryRun          bool            `json:"dry_run"`
 	Items           any             `json:"items"`
 	Errors          []string        `json:"errors"`
+	Warnings        []string        `json:"warnings,omitempty"`
 	CleanupPolicies []cleanupPolicy `json:"cleanup_policies,omitempty"`
 }
 
@@ -96,6 +98,9 @@ func output(cmd *cobra.Command, o options, env envelope, lines []string) error {
 		for _, s := range env.Errors {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", s)
 		}
+	}
+	for _, warning := range env.Warnings {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
 	}
 	if err := cmd.Context().Err(); err != nil {
 		return err
@@ -284,6 +289,10 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 func newCleanCmd() *cobra.Command {
+	return newCleanCmdWithRunner(cleanup.RunBatch)
+}
+
+func newCleanCmdWithRunner(run func(context.Context, []cleanup.Target, bool) ([]cleanup.Result, error)) *cobra.Command {
 	var o options
 	var apply, dryRun, discard bool
 	var level string
@@ -332,7 +341,7 @@ func newCleanCmd() *cobra.Command {
 				lines = append(lines, "Aggressive cleanup force-removes checkout files, including local changes; branch refs are retained")
 			}
 		}
-		results, err := cleanup.RunBatch(cmd.Context(), targets, effectiveApply)
+		results, err := run(cmd.Context(), targets, effectiveApply)
 		errs := []string{}
 		if err != nil {
 			errs = append(errs, err.Error())
@@ -340,14 +349,22 @@ func newCleanCmd() *cobra.Command {
 		if len(results) == 0 && err == nil {
 			lines = append(lines, "No repositories found")
 		}
+		warnings := []string{}
+		seenWarnings := map[string]bool{}
 		for _, r := range results {
+			for _, warning := range r.Warnings {
+				if !seenWarnings[warning] {
+					warnings = append(warnings, warning)
+					seenWarnings[warning] = true
+				}
+			}
 			destructive := ""
 			if r.Destructive {
 				destructive = " [FORCE REMOVAL]"
 			}
 			lines = append(lines, fmt.Sprintf("%-14s %q%s: %s", r.Action, r.Path, destructive, r.Reason))
 		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !effectiveApply, Items: results, Errors: errs, CleanupPolicies: policies}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !effectiveApply, Items: results, Errors: errs, CleanupPolicies: policies, Warnings: warnings}, lines)
 	}}
 	bind(cmd, &o)
 	cmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview eligible removals and metadata pruning without changing anything")

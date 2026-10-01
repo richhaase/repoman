@@ -233,7 +233,10 @@ func TestAggressiveAllowsContentChangesUnderExplicitPolicy(t *testing.T) {
 func realEngine() engine {
 	knownUsage := func(s repository.State) repository.State {
 		s.InUse, s.InUseKnown, s.SafetyProblems = false, true, nil
-		s.CwdInUse, s.CwdInUseKnown, s.CwdProblems = false, true, nil
+		// Preserve the cwd signal for paths owned by this fixture. Unrelated host
+		// processes may be inaccessible in CI; unknown-state policy is tested with
+		// explicit failing observations in the engine tests.
+		s.CwdInUseKnown, s.CwdProblems = true, nil
 		return s
 	}
 	e := fixtureEngine(nil)

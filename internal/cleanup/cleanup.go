@@ -27,6 +27,8 @@ const (
 	ActionFailed      = "failed"
 )
 
+const incompleteProcessWarning = "Current-user process observation is incomplete; aggressive cleanup protects observed working directories only. Unobserved processes may still use eligible worktrees."
+
 type Result struct {
 	Path        string           `json:"path"`
 	Action      string           `json:"action"`
@@ -34,6 +36,7 @@ type Result struct {
 	Level       Level            `json:"level"`
 	Destructive bool             `json:"destructive"`
 	State       repository.State `json:"state"`
+	Warnings    []string         `json:"warnings,omitempty"`
 }
 
 type evidence struct {
@@ -72,6 +75,32 @@ func RunWithOptions(ctx context.Context, root string, apply bool, includes, excl
 // RunBatch completes inventory and PR preflight for ALL targets before mutation.
 // A later removal failure stops the batch and retains truthful partial results.
 func RunBatch(ctx context.Context, targets []Target, apply bool) ([]Result, error) {
+	return RunBatchWithInventory(ctx, targets, apply, gitInventory{})
+}
+
+// Inventory supplies read-only repository snapshots. Implementations must retain
+// unknown identity and process state; both methods are called during revalidation.
+// The default runner uses repository.Discover and repository.Inspect.
+type Inventory interface {
+	Discover(context.Context, string) ([]repository.State, error)
+	Inspect(context.Context, string) repository.State
+}
+
+type gitInventory struct{}
+
+func (gitInventory) Discover(ctx context.Context, root string) ([]repository.State, error) {
+	return repository.Discover(ctx, root)
+}
+func (gitInventory) Inspect(ctx context.Context, path string) repository.State {
+	return repository.Inspect(ctx, path)
+}
+
+// RunBatchWithInventory uses an explicit inspection dependency while retaining
+// the normal policy, GitHub evidence, identity rechecks, and Git mutations.
+func RunBatchWithInventory(ctx context.Context, targets []Target, apply bool, inventory Inventory) ([]Result, error) {
+	if inventory == nil {
+		return nil, errors.New("cleanup inventory is required")
+	}
 	engines := make([]engine, len(targets))
 	roots := make([]string, len(targets))
 	for i, target := range targets {
@@ -80,7 +109,7 @@ func RunBatch(ctx context.Context, targets []Target, apply bool) ([]Result, erro
 			return nil, err
 		}
 		engines[i] = engine{
-			discover: repository.Discover, inspect: repository.Inspect,
+			discover: inventory.Discover, inspect: inventory.Inspect,
 			lookup: func(ctx context.Context, s repository.State) (evidence, error) {
 				return lookupEvidenceForLevel(ctx, s, readPullRequests, options.Level)
 			},
@@ -103,6 +132,7 @@ type cleanupPlan struct {
 	states     []repository.State
 	results    []Result
 	identities map[string][]pathIdentity
+	warnings   []string
 }
 
 func runEngines(ctx context.Context, engines []engine, roots []string, apply bool) ([]Result, error) {
@@ -119,11 +149,16 @@ func runEngines(ctx context.Context, engines []engine, roots []string, apply boo
 	}
 	collect := func(block string) []Result {
 		results := []Result{}
+		warnings := []string{}
 		for _, p := range plans {
 			if block != "" {
 				p.results = blockPending(p.results, block)
 			}
 			results = append(results, p.results...)
+			warnings = mergeWarnings(warnings, p.warnings)
+		}
+		if len(results) > 0 {
+			results[0].Warnings = mergeWarnings(results[0].Warnings, warnings)
 		}
 		return results
 	}
@@ -145,9 +180,11 @@ func runEngines(ctx context.Context, engines []engine, roots []string, apply boo
 				if r.Level != prior.Level {
 					return collect("overlapping targets have conflicting cleanup levels"), fmt.Errorf("overlapping targets select %q with conflicting cleanup levels %s and %s", r.Path, prior.Level, r.Level)
 				}
+				warnings := mergeWarnings(prior.Warnings, r.Warnings)
 				if r.Action == ActionKeep {
 					*prior = r
 				}
+				prior.Warnings = warnings
 				continue
 			}
 			filtered = append(filtered, r)
@@ -211,6 +248,7 @@ func (e engine) plan(ctx context.Context, root string, apply bool) (*cleanupPlan
 		r := Result{Path: s.Path, Action: ActionKeep, Level: options.Level, State: s}
 		r.Reason = selectionProtection(p.states, s, e.includes, e.excludes)
 		if r.Reason == "" {
+			recordObservationWarning(&r, s, options.Level)
 			if issue := inspectionFailure(s, options.Level); issue != "" {
 				r.Reason = issue
 				failures = append(failures, fmt.Errorf("inspect %q: %s", s.Path, issue))
@@ -278,11 +316,7 @@ func inspectionFailure(s repository.State, level Level) string {
 	if len(s.IdentityProblems) > 0 {
 		return "repository identity inspection failed: " + strings.Join(s.IdentityProblems, "; ")
 	}
-	if level == Aggressive {
-		if !s.CwdInUseKnown || len(s.CwdProblems) > 0 {
-			return "current-user working directories could not be observed: " + strings.Join(s.CwdProblems, "; ")
-		}
-	} else if !s.InUseKnown || len(s.SafetyProblems) > 0 {
+	if level != Aggressive && (!s.InUseKnown || len(s.SafetyProblems) > 0) {
 		return "current-user process usage could not be observed: " + strings.Join(s.SafetyProblems, "; ")
 	}
 	return ""
@@ -328,8 +362,24 @@ func (p *cleanupPlan) preflight(ctx context.Context) error {
 		return fmt.Errorf("revalidate inventory: %w", err)
 	}
 	fresh = normalizeStates(fresh)
+	p.recordObservationWarnings(fresh)
 	if !sameInventory(p.states, fresh, p.engine.options.Level) {
 		return errors.New("cleanup inventory changed during planning; no worktrees removed")
+	}
+	freshByPath := make(map[string]repository.State, len(fresh))
+	for _, s := range fresh {
+		freshByPath[s.Path] = s
+	}
+	for i := range p.results {
+		r := &p.results[i]
+		if s, ok := freshByPath[r.Path]; ok {
+			r.State = s
+			if p.engine.options.Level == Aggressive && s.CwdInUse && (r.Action == ActionWouldRemove || r.Action == ActionWouldPrune) {
+				r.Action = ActionKeep
+				r.Destructive = false
+				r.Reason = "worktree became a current-user process working directory"
+			}
+		}
 	}
 	for _, r := range p.results {
 		if err := validateIdentities(p.identities[r.Path]); err != nil {
@@ -340,14 +390,15 @@ func (p *cleanupPlan) preflight(ctx context.Context) error {
 }
 
 // Aggressive policy deliberately does not compare optional content diagnostics.
-// Identity, registration, PR refs, explicit locks and cwd observation still must match.
+// Identity, registration, PR refs, explicit locks and positive cwd signals must match.
+// Incomplete observation remains visible as a warning, not a default-policy veto.
 func comparableState(s repository.State, level Level) repository.State {
 	if level != Aggressive {
 		return s
 	}
 	return repository.State{Path: s.Path, CommonDir: s.CommonDir, GitDir: s.GitDir, Head: s.Head, Branch: s.Branch, Origin: s.Origin,
 		Primary: s.Primary, Bare: s.Bare, WorktreeLocked: s.WorktreeLocked, Prunable: s.Prunable, Missing: s.Missing,
-		CwdInUse: s.CwdInUse, CwdInUseKnown: s.CwdInUseKnown, CwdProblems: s.CwdProblems,
+		CwdInUse:         s.CwdInUse,
 		IdentityProblems: s.IdentityProblems, PRNumbers: s.PRNumbers}
 }
 func sameInventory(a, b []repository.State, level Level) bool {
@@ -355,7 +406,12 @@ func sameInventory(a, b []repository.State, level Level) bool {
 		return false
 	}
 	for i := range a {
-		if !reflect.DeepEqual(comparableState(a[i], level), comparableState(b[i], level)) {
+		old, current := comparableState(a[i], level), comparableState(b[i], level)
+		if level == Aggressive {
+			old.CwdInUse = false
+			current.CwdInUse = false
+		}
+		if !reflect.DeepEqual(old, current) {
 			return false
 		}
 	}
@@ -384,6 +440,19 @@ func (p *cleanupPlan) apply(ctx context.Context) error {
 			continue
 		}
 		fresh := normalizeState(p.engine.inspect(ctx, r.Path))
+		recordObservationWarning(r, fresh, p.engine.options.Level)
+		// A newly observed cwd protects this candidate, while unrelated candidates
+		// can proceed. Any simultaneous identity/lock/registration change still fails.
+		if p.engine.options.Level == Aggressive && fresh.CwdInUse && sameInventory([]repository.State{r.State}, []repository.State{fresh}, Aggressive) && inspectionFailure(fresh, Aggressive) == "" {
+			if err := validateIdentities(p.identities[r.Path]); err != nil {
+				return err
+			}
+			r.State = fresh
+			r.Action = ActionKeep
+			r.Destructive = false
+			r.Reason = "worktree became a current-user process working directory"
+			continue
+		}
 		if !reflect.DeepEqual(comparableState(r.State, p.engine.options.Level), comparableState(fresh, p.engine.options.Level)) || localProtectionForLevel(p.root.resolved, fresh, p.engine.options.Level) != "" || inspectionFailure(fresh, p.engine.options.Level) != "" {
 			return fmt.Errorf("worktree %q changed immediately before removal", r.Path)
 		}
@@ -411,6 +480,7 @@ func (p *cleanupPlan) applyPrune(ctx context.Context, common string) error {
 	if err != nil {
 		return fmt.Errorf("revalidate stale metadata: %w", err)
 	}
+	p.recordObservationWarnings(fresh)
 	current := map[string]repository.State{}
 	for _, s := range fresh {
 		current[s.Path] = normalizeState(s)
@@ -457,6 +527,7 @@ func (p *cleanupPlan) applyPrune(ctx context.Context, common string) error {
 	if err != nil {
 		return errors.Join(pruneErr, fmt.Errorf("verify metadata pruning: %w", err))
 	}
+	p.recordObservationWarnings(fresh)
 	remaining := map[string]bool{}
 	for _, s := range fresh {
 		remaining[s.Path] = true
@@ -566,8 +637,6 @@ func localProtectionForLevel(root string, state repository.State, level Level) s
 		return "missing worktree is not prunable"
 	case level == Aggressive && state.CwdInUse:
 		return "worktree is a current-user process working directory"
-	case level == Aggressive && (!state.CwdInUseKnown || len(state.CwdProblems) > 0):
-		return "working directory usage could not be established safely"
 	case level != Aggressive && len(state.Problems) > 0:
 		return "repository inspection is incomplete"
 	case level != Aggressive && state.Dirty:
@@ -719,4 +788,41 @@ func pruneWorktrees(ctx context.Context, state repository.State) error {
 		return fmt.Errorf("git worktree prune: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func mergeWarnings(existing, extra []string) []string {
+	for _, warning := range extra {
+		found := false
+		for _, current := range existing {
+			if current == warning {
+				found = true
+				break
+			}
+		}
+		if !found {
+			existing = append(existing, warning)
+		}
+	}
+	return existing
+}
+
+func recordObservationWarning(r *Result, s repository.State, level Level) {
+	if level == Aggressive && (!s.CwdInUseKnown || len(s.CwdProblems) > 0) {
+		r.Warnings = mergeWarnings(r.Warnings, []string{incompleteProcessWarning})
+	}
+}
+
+func (p *cleanupPlan) recordObservationWarnings(states []repository.State) {
+	byPath := make(map[string]repository.State, len(states))
+	for _, s := range states {
+		byPath[s.Path] = s
+		if p.engine.options.Level == Aggressive && (!s.CwdInUseKnown || len(s.CwdProblems) > 0) {
+			p.warnings = mergeWarnings(p.warnings, []string{incompleteProcessWarning})
+		}
+	}
+	for i := range p.results {
+		if s, ok := byPath[p.results[i].Path]; ok {
+			recordObservationWarning(&p.results[i], s, p.engine.options.Level)
+		}
+	}
 }

@@ -152,8 +152,10 @@ func TestAggressiveCwdAndOpenPRProtection(t *testing.T) {
 					cwd = filepath.Join(root, "primary")
 				}
 				t.Chdir(cwd)
-				e.discover = repository.Discover
-				e.inspect = repository.Inspect
+				observed := repository.Inspect(t.Context(), cwd)
+				if !observed.CwdInUse {
+					t.Fatalf("owned cwd signal was not observed: %+v", observed)
+				}
 			case "open file only":
 				baseDiscover, baseInspect := e.discover, e.inspect
 				withFD := func(s repository.State) repository.State {
@@ -194,8 +196,10 @@ func TestOtherCurrentUserProcessCwdPreservesWorktree(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
 	e := aggressiveRealEngine()
-	e.discover = repository.Discover
-	e.inspect = repository.Inspect
+	observed := repository.Inspect(t.Context(), s.Path)
+	if !observed.CwdInUse {
+		t.Fatalf("owned child cwd signal was not observed: %+v", observed)
+	}
 	results, err := e.run(t.Context(), root, true)
 	if err != nil || results[1].Action != ActionKeep || !results[1].State.CwdInUse {
 		t.Fatalf("results=%+v err=%v", results, err)
@@ -203,7 +207,7 @@ func TestOtherCurrentUserProcessCwdPreservesWorktree(t *testing.T) {
 }
 
 func TestAggressiveRechecksExplicitLockCwdAndIdentity(t *testing.T) {
-	for _, kind := range []string{"lock", "cwd", "identity failure", "process failure"} {
+	for _, kind := range []string{"lock", "cwd", "identity failure"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			s := syntheticState(t, root, "topic")
@@ -217,14 +221,13 @@ func TestAggressiveRechecksExplicitLockCwdAndIdentity(t *testing.T) {
 					s.CwdInUse = true
 				case "identity failure":
 					s.IdentityProblems = []string{"registration failed"}
-				case "process failure":
-					s.CwdInUseKnown = false
 				}
 				return s
 			}
 			e.remove = func(context.Context, repository.State) error { t.Fatal("changed checkout removed"); return nil }
 			results, err := e.run(t.Context(), root, true)
-			if err == nil || results[0].Action != ActionKeep {
+			wantErr := kind != "cwd"
+			if (err != nil) != wantErr || results[0].Action != ActionKeep {
 				t.Fatalf("results=%+v err=%v", results, err)
 			}
 		})
@@ -232,7 +235,7 @@ func TestAggressiveRechecksExplicitLockCwdAndIdentity(t *testing.T) {
 }
 
 func TestBatchPreflightFailsBeforeAnyRootMutation(t *testing.T) {
-	for _, stage := range []string{"inventory", "PR planning", "PR revalidation", "process", "identity"} {
+	for _, stage := range []string{"inventory", "PR planning", "PR revalidation", "identity"} {
 		t.Run(stage, func(t *testing.T) {
 			first, firstState := realWorktree(t)
 			second, _ := realWorktree(t)
@@ -251,16 +254,12 @@ func TestBatchPreflightFailsBeforeAnyRootMutation(t *testing.T) {
 					}
 					return evidence{eligible: true}, nil
 				}
-			case "process", "identity":
+			case "identity":
 				discover := b.discover
 				b.discover = func(ctx context.Context, root string) ([]repository.State, error) {
 					ss, err := discover(ctx, root)
 					for i := range ss {
-						if stage == "process" {
-							ss[i].CwdInUseKnown = false
-						} else {
-							ss[i].IdentityProblems = []string{"Git identity failed"}
-						}
+						ss[i].IdentityProblems = []string{"Git identity failed"}
 					}
 					return ss, err
 				}
@@ -473,8 +472,19 @@ func TestPruneDefersForProtectedDeletedWorkingDirectory(t *testing.T) {
 		}
 	}
 	e := aggressiveRealEngine()
-	e.discover = repository.Discover
-	e.inspect = repository.Inspect
+	observed, observeErr := repository.Discover(t.Context(), root)
+	if observeErr != nil {
+		t.Fatal(observeErr)
+	}
+	foundCwd := false
+	for _, state := range observed {
+		if state.Path == s.Path && state.CwdInUse {
+			foundCwd = true
+		}
+	}
+	if !foundCwd {
+		t.Fatalf("owned deleted cwd signal was not observed: %+v", observed)
+	}
 	for _, apply := range []bool{false, true} {
 		results, err := e.run(t.Context(), root, apply)
 		if err != nil {
@@ -536,5 +546,179 @@ func TestAllKeptApplyDoesNotRevalidateOrMutate(t *testing.T) {
 		if discoveries[i] != 1 || result.Action != ActionKeep || result.Destructive {
 			t.Fatalf("unexpected no-op result: discoveries=%v results=%+v", discoveries, results)
 		}
+	}
+}
+
+func TestAggressiveIncompleteObservationWarningsAcrossPhases(t *testing.T) {
+	for _, phase := range []string{"initial", "revalidation", "immediate"} {
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			base := syntheticState(t, root, "topic")
+			unknown := func(s repository.State) repository.State {
+				s.CwdInUseKnown = false
+				s.CwdProblems = []string{"fixture unrelated process inaccessible"}
+				return s
+			}
+			e := fixtureEngine([]repository.State{base})
+			e.options = Options{Level: Aggressive}
+			calls := 0
+			e.discover = func(context.Context, string) ([]repository.State, error) {
+				calls++
+				s := base
+				if phase == "initial" && calls == 1 || phase == "revalidation" && calls == 2 {
+					s = unknown(s)
+				}
+				return []repository.State{s}, nil
+			}
+			e.inspect = func(context.Context, string) repository.State {
+				if phase == "immediate" {
+					return unknown(base)
+				}
+				return base
+			}
+			results, err := e.run(t.Context(), root, true)
+			if err != nil || results[0].Action != ActionRemoved || len(results[0].Warnings) != 1 {
+				t.Fatalf("results=%+v err=%v", results, err)
+			}
+			if phase == "immediate" && (results[0].State.CwdInUseKnown || len(results[0].State.CwdProblems) == 0) {
+				t.Fatal("final uncertainty was hidden", results)
+			}
+		})
+	}
+}
+
+func TestAggressiveSiblingCwdChangeDoesNotBlockCandidate(t *testing.T) {
+	for _, keptSibling := range []bool{false, true} {
+		t.Run(map[bool]string{false: "primary", true: "locked sibling"}[keptSibling], func(t *testing.T) {
+			root := t.TempDir()
+			candidate := syntheticState(t, root, "candidate")
+			sibling := syntheticState(t, root, "sibling")
+			if keptSibling {
+				sibling.WorktreeLocked = true
+			} else {
+				sibling.Primary = true
+				sibling.Path = filepath.Dir(sibling.CommonDir)
+				sibling.GitDir = sibling.CommonDir
+			}
+			e := fixtureEngine([]repository.State{candidate, sibling})
+			e.options = Options{Level: Aggressive}
+			calls := 0
+			e.discover = func(context.Context, string) ([]repository.State, error) {
+				calls++
+				s := sibling
+				if calls > 1 {
+					s.CwdInUse = true
+					s.CwdInUseKnown = false
+					s.CwdProblems = []string{"other observation denied"}
+				}
+				return []repository.State{candidate, s}, nil
+			}
+			results, err := e.run(t.Context(), root, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range results {
+				if r.Path == candidate.Path && r.Action != ActionRemoved {
+					t.Fatalf("sibling cwd blocked candidate: %+v", results)
+				}
+			}
+		})
+	}
+}
+
+func TestAggressiveNewCandidateCwdKeepsOnlyAffectedWorktree(t *testing.T) {
+	for _, phase := range []string{"preflight", "immediate"} {
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			a, b := syntheticState(t, root, "a"), syntheticState(t, root, "b")
+			used := func(s repository.State) repository.State {
+				s.CwdInUse = true
+				s.CwdInUseKnown = false
+				s.CwdProblems = []string{"another process unavailable"}
+				return s
+			}
+			e := fixtureEngine([]repository.State{a, b})
+			e.options = Options{Level: Aggressive}
+			calls := 0
+			e.discover = func(context.Context, string) ([]repository.State, error) {
+				calls++
+				first := a
+				if phase == "preflight" && calls > 1 {
+					first = used(first)
+				}
+				return []repository.State{first, b}, nil
+			}
+			e.inspect = func(_ context.Context, path string) repository.State {
+				if path == a.Path {
+					return used(a)
+				}
+				return b
+			}
+			results, err := e.run(t.Context(), root, true)
+			if err != nil || results[0].Action != ActionKeep || results[1].Action != ActionRemoved || len(results[0].Warnings) != 1 {
+				t.Fatalf("results=%+v err=%v", results, err)
+			}
+		})
+	}
+}
+
+func TestPruneRefreshObservationWarningSurvives(t *testing.T) {
+	for _, phase := range []int{3, 4} {
+		t.Run(map[int]string{3: "before prune", 4: "after prune"}[phase], func(t *testing.T) {
+			root, s := realWorktree(t)
+			if err := os.RemoveAll(s.Path); err != nil {
+				t.Fatal(err)
+			}
+			old := time.Now().AddDate(-1, 0, 0)
+			if err := os.Chtimes(filepath.Join(s.GitDir, "gitdir"), old, old); err != nil {
+				t.Fatal(err)
+			}
+			e := aggressiveRealEngine()
+			discover := e.discover
+			calls := 0
+			e.discover = func(ctx context.Context, root string) ([]repository.State, error) {
+				states, err := discover(ctx, root)
+				calls++
+				if calls == phase {
+					for i := range states {
+						states[i].CwdInUseKnown = false
+						states[i].CwdProblems = []string{"fixture prune observation denied"}
+					}
+				}
+				return states, err
+			}
+			results, err := e.run(t.Context(), root, true)
+			if err != nil || results[1].Action != ActionPruned {
+				t.Fatalf("results=%+v err=%v", results, err)
+			}
+			warned := false
+			for _, r := range results {
+				warned = warned || len(r.Warnings) > 0
+			}
+			if !warned {
+				t.Fatalf("late prune warning was lost: %+v", results)
+			}
+		})
+	}
+}
+
+func TestOverlappingRootRevalidationWarningSurvivesDeduplication(t *testing.T) {
+	root := t.TempDir()
+	s := syntheticState(t, root, "candidate")
+	a, b := fixtureEngine([]repository.State{s}), fixtureEngine([]repository.State{s})
+	a.options, b.options = Options{Level: Aggressive}, Options{Level: Aggressive}
+	calls := 0
+	b.discover = func(context.Context, string) ([]repository.State, error) {
+		calls++
+		fresh := s
+		if calls == 2 {
+			fresh.CwdInUseKnown = false
+			fresh.CwdProblems = []string{"second root observation denied"}
+		}
+		return []repository.State{fresh}, nil
+	}
+	results, err := runEngines(t.Context(), []engine{a, b}, []string{root, root}, true)
+	if err != nil || len(results) != 1 || results[0].Action != ActionRemoved || len(results[0].Warnings) != 1 {
+		t.Fatalf("results=%+v err=%v", results, err)
 	}
 }
