@@ -26,11 +26,18 @@ func (e *ExitError) Error() string { return e.Err.Error() }
 func (e *ExitError) Unwrap() error { return e.Err }
 
 type envelope struct {
-	SchemaVersion int      `json:"schema_version"`
-	Command       string   `json:"command"`
-	DryRun        bool     `json:"dry_run"`
-	Items         any      `json:"items"`
-	Errors        []string `json:"errors"`
+	SchemaVersion   int             `json:"schema_version"`
+	Command         string          `json:"command"`
+	DryRun          bool            `json:"dry_run"`
+	Items           any             `json:"items"`
+	Errors          []string        `json:"errors"`
+	CleanupPolicies []cleanupPolicy `json:"cleanup_policies,omitempty"`
+}
+
+type cleanupPolicy struct {
+	Root                string        `json:"root"`
+	Level               cleanup.Level `json:"level"`
+	DiscardLocalChanges bool          `json:"discard_local_changes"`
 }
 
 type options struct {
@@ -186,7 +193,7 @@ func newStatusCmd() *cobra.Command {
 				}
 			}
 		}
-		return output(cmd, o, envelope{1, "status", true, states, errs}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "status", DryRun: true, Items: states, Errors: errs}, lines)
 	}}
 	bind(cmd, &o)
 	return cmd
@@ -230,7 +237,7 @@ func newSyncCmd() *cobra.Command {
 				lines = append(lines, fmt.Sprintf("%-14s %s: %s", r.Action, r.Name, r.Reason))
 			}
 		}
-		return output(cmd, o, envelope{1, "sync", dryRun, results, errs}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs}, lines)
 	}}
 	bind(cmd, &o)
 	cmd.Flags().StringVar(&owner, "owner", "", "GitHub user or organization (required for ad hoc sync)")
@@ -243,8 +250,9 @@ func newSyncCmd() *cobra.Command {
 }
 func newCleanCmd() *cobra.Command {
 	var o options
-	var apply bool
-	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Preview safe worktree cleanup; --apply revalidates and removes eligible worktrees", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	var apply, discard bool
+	var level string
+	cmd := &cobra.Command{Use: "clean [DIR]", Short: "Preview cleanup under a configurable policy; apply explicitly", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		ts, e := selection(cmd, o, args)
 		if e != nil {
 			return e
@@ -252,23 +260,65 @@ func newCleanCmd() *cobra.Command {
 		if apply && len(ts) > 1 {
 			return &ExitError{Code: 2, Err: fmt.Errorf("--apply requires one target; select DIR or --root")}
 		}
+		policies := make([]cleanupPolicy, 0, len(ts))
+		// Validate every selected policy before inspecting or changing any target.
+		for _, t := range ts {
+			raw := t.CleanupLevel
+			if cmd.Flags().Changed("level") {
+				raw = level
+				if strings.TrimSpace(raw) == "" {
+					return &ExitError{Code: 2, Err: fmt.Errorf("--level cannot be empty")}
+				}
+			}
+			effective, err := cleanup.ParseLevel(raw)
+			if err != nil {
+				return &ExitError{Code: 2, Err: err}
+			}
+			if discard && effective != cleanup.Aggressive {
+				return &ExitError{Code: 2, Err: fmt.Errorf("--discard-local-changes requires --level aggressive (or configured aggressive level)")}
+			}
+			if apply && effective == cleanup.Aggressive && !discard {
+				return &ExitError{Code: 2, Err: fmt.Errorf("aggressive apply can permanently discard tracked changes, untracked files, and ignored files; preview first, then explicitly pass --discard-local-changes")}
+			}
+			policies = append(policies, cleanupPolicy{Root: t.Dir, Level: effective, DiscardLocalChanges: discard})
+		}
 		results := []cleanup.Result{}
 		errs := []string{}
 		lines := []string{}
-		for _, t := range ts {
-			slog.DebugContext(cmd.Context(), "planning cleanup", "root", t.Dir, "apply", apply)
-			rs, e := cleanup.RunFiltered(cmd.Context(), filepath.Clean(t.Dir), apply, t.Includes, t.Excludes)
+		for i, t := range ts {
+			policy := policies[i]
+			phase := "preview"
+			if apply {
+				phase = "apply"
+			}
+			lines = append(lines, fmt.Sprintf("cleanup %s | level=%s | root=%q", phase, policy.Level, t.Dir))
+			if policy.Level == cleanup.Aggressive {
+				lines = append(lines, "WARNING: aggressive cleanup can permanently discard tracked changes, untracked files, and ignored files")
+				if !apply {
+					lines = append(lines, "Preview only. Applying aggressive cleanup requires --apply --discard-local-changes")
+				}
+			}
+			slog.DebugContext(cmd.Context(), "planning cleanup", "root", t.Dir, "apply", apply, "level", policy.Level)
+			rs, e := cleanup.RunWithOptions(cmd.Context(), filepath.Clean(t.Dir), apply, t.Includes, t.Excludes, cleanup.Options{Level: policy.Level, DiscardLocalChanges: discard})
 			results = append(results, rs...)
 			if e != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
+			} else if len(rs) == 0 {
+				lines = append(lines, "No repositories found")
 			}
 			for _, r := range rs {
-				lines = append(lines, fmt.Sprintf("%-14s %q: %s", r.Action, r.Path, r.Reason))
+				destructive := ""
+				if r.Destructive {
+					destructive = " [DISCARDS LOCAL FILES]"
+				}
+				lines = append(lines, fmt.Sprintf("%-14s %q%s: %s", r.Action, r.Path, destructive, r.Reason))
 			}
 		}
-		return output(cmd, o, envelope{1, "clean", !apply, results, errs}, lines)
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "clean", DryRun: !apply, Items: results, Errors: errs, CleanupPolicies: policies}, lines)
 	}}
 	bind(cmd, &o)
-	cmd.Flags().BoolVar(&apply, "apply", false, "revalidate the plan and remove eligible worktrees (never force)")
+	cmd.Flags().BoolVar(&apply, "apply", false, "revalidate the selected policy and remove eligible worktrees")
+	cmd.Flags().StringVar(&level, "level", "", "cleanup level: conservative (default), balanced, or aggressive; overrides config")
+	cmd.Flags().BoolVar(&discard, "discard-local-changes", false, "authorize permanent loss of tracked changes, untracked files, and ignored files; required for aggressive apply")
 	return cmd
 }

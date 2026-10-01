@@ -27,12 +27,13 @@ import (
 // Includes and Excludes match repository names using path.Match globs.
 // Event-based activity is deliberately unsupported; nil or false means pushes only.
 type Target struct {
-	Dir      string   `json:"dir"`
-	Owner    string   `json:"owner"`
-	Days     int      `json:"days"`
-	Includes []string `json:"includes,omitempty"`
-	Excludes []string `json:"excludes,omitempty"`
-	Events   *bool    `json:"events,omitempty"`
+	Dir          string   `json:"dir"`
+	Owner        string   `json:"owner"`
+	Days         int      `json:"days"`
+	Includes     []string `json:"includes,omitempty"`
+	Excludes     []string `json:"excludes,omitempty"`
+	Events       *bool    `json:"events,omitempty"`
+	CleanupLevel string   `json:"cleanup_level,omitempty"`
 }
 
 // Result records either a completed action, a dry-run plan, or a reason for skipping.

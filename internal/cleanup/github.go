@@ -43,6 +43,10 @@ func githubEvidence(ctx context.Context, state repository.State) (evidence, erro
 }
 
 func lookupEvidence(ctx context.Context, state repository.State, read apiReader) (evidence, error) {
+	return lookupEvidenceForLevel(ctx, state, read, Conservative)
+}
+
+func lookupEvidenceForLevel(ctx context.Context, state repository.State, read apiReader, level Level) (evidence, error) {
 	repo, ok := githubOrigin(state.Origin)
 	if !ok {
 		return evidence{reason: "origin is not an unambiguous github.com repository"}, nil
@@ -89,6 +93,9 @@ func lookupEvidence(ctx context.Context, state repository.State, read apiReader)
 		if len(open) > 0 {
 			return evidence{reason: "current branch has an open PR"}, nil
 		}
+	}
+	if level == Balanced || level == Aggressive {
+		return evidence{eligible: true, reason: "GitHub checks verified no open PR for current commit or branch"}, nil
 	}
 	if !terminal {
 		return evidence{reason: "no terminal PR matches exact current HEAD and origin repository"}, nil

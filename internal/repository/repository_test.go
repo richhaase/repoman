@@ -36,11 +36,21 @@ func writeTest(t *testing.T, path, value string) {
 	}
 }
 
+// Match Inspect's canonical-path contract even when macOS TMPDIR uses /var aliases.
+func repoTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func fixture(t *testing.T) (root, repo string) {
 	t.Helper()
-	root = t.TempDir()
+	root = repoTempDir(t)
 	repo = filepath.Join(root, "clone")
-	remote := filepath.Join(t.TempDir(), "origin.git")
+	remote := filepath.Join(repoTempDir(t), "origin.git")
 	gitTest(t, root, "init", "--bare", "--initial-branch=main", remote)
 	gitTest(t, root, "init", "--initial-branch=main", repo)
 	writeTest(t, filepath.Join(repo, "tracked"), "original\n")
@@ -220,7 +230,7 @@ func TestInspectRejectsInheritedRepositoryAndSymlinks(t *testing.T) {
 
 func TestDiscoverLinkedWorktreesOutsideRootAndDedup(t *testing.T) {
 	root, repo := fixture(t)
-	outside := filepath.Join(t.TempDir(), "linked \t\n checkout\n")
+	outside := filepath.Join(repoTempDir(t), "linked \t\n checkout\n")
 	inside := filepath.Join(root, "second")
 	gitTest(t, repo, "worktree", "add", "--detach", outside)
 	gitTest(t, repo, "worktree", "add", "--detach", inside)
@@ -253,7 +263,7 @@ func TestDiscoverLinkedWorktreesOutsideRootAndDedup(t *testing.T) {
 
 func TestDiscoverInvalidAndMissingWorktree(t *testing.T) {
 	root, repo := fixture(t)
-	linked := filepath.Join(t.TempDir(), "missing")
+	linked := filepath.Join(repoTempDir(t), "missing")
 	gitTest(t, repo, "worktree", "add", "--detach", linked)
 	if err := os.RemoveAll(linked); err != nil {
 		t.Fatal(err)
@@ -368,7 +378,7 @@ func TestApplyUsageBoundariesAndUnknown(t *testing.T) {
 
 func TestObserveProcFailure(t *testing.T) {
 	var usage processUsage
-	usage.observeProc(context.Background(), filepath.Join(t.TempDir(), "missing"))
+	usage.observeProc(context.Background(), filepath.Join(repoTempDir(t), "missing"))
 	if len(usage.problems) == 0 {
 		t.Fatal("unknown process inventory was treated as safe")
 	}
@@ -437,7 +447,7 @@ func TestProcessOwnershipScope(t *testing.T) {
 }
 
 func TestObserveProcCurrentUserAndUnknown(t *testing.T) {
-	root := t.TempDir()
+	root := repoTempDir(t)
 	ownDir := filepath.Join(root, "123")
 	otherDir := filepath.Join(root, "456")
 	for _, dir := range []string{ownDir, otherDir} {
@@ -478,7 +488,7 @@ func TestLsofCurrentUserScopeAndFailures(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper uses POSIX shell")
 	}
-	bin := t.TempDir()
+	bin := repoTempDir(t)
 	executable := filepath.Join(bin, "lsof")
 	script := "#!/bin/sh\n[ \"$1\" = '-nP' ] && [ \"$2\" = '-u' ] && [ \"$3\" = '" + strconv.Itoa(os.Geteuid()) + "' ] && [ \"$4\" = '-F0pn' ] || exit 2\nprintf 'p123\\000ncwd-path\\000\\nn/tmp/repo with\\nnewline/file\\000\\n'\n"
 	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil { // #nosec G306 -- executable fixture script in an isolated test directory.

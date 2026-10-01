@@ -59,6 +59,7 @@ JSON, read-only to repoman; there is no implicit migration or registry write.
       "owner": "richhaase",
       "days": 45,
       "events": false,
+      "cleanup_level": "conservative",
       "includes": [],
       "excludes": ["prototype-*"]
     }
@@ -83,8 +84,8 @@ repoman sync ~/src --config ~/.config/sync-repos/config.json --no-events --dry-r
 
 This MVP uses GitHub push activity only. An explicit legacy `events: true` is
 rejected by sync unless `--no-events` is supplied. Days default to 45. Unlike the
-original scripts, there is no force mode, automatic inactive-clone deletion,
-config mutation, or event-API fallback. Primary clones are inventoried and always
+original scripts, there is no force-sync mode, automatic inactive-clone deletion,
+config mutation, or event-API fallback. Cleanup aggression is configured separately. Primary clones are inventoried and always
 kept by cleanup; retirement of inactive primary clones is deferred.
 
 ## Safety contract
@@ -114,29 +115,75 @@ or all-remotes fetch is used. Dry-run performs remote reads but no clone/fetch.
 
 ### Clean
 
-Never removes primary checkouts. A linked worktree must be inside the selected
-root, observable and clean, with no untracked or ignored files, local-only commits,
-stash, locks, or process-use evidence. An in-use sibling checkout or shared Git
-metadata protects all worktrees of that repository. Unknown process observations
-protect it.
-GitHub must confirm a terminal PR for the exact current HEAD in the same repository,
-with no open PR on the branch. No PR, missing access, API failure, unsupported
-origin, uncertain identity, or missing metadata means keep/error, never permission
-to remove. Remote tracking refs are not refreshed during cleanup.
+Cleanup always previews unless `--apply` is supplied. Choose a per-target
+`cleanup_level` in JSON or override it for this invocation with `clean --level`.
+The default is `conservative`; existing configurations retain their behavior.
 
-`--apply` creates a fresh plan, validates the complete inventory and GitHub evidence
-again before mutation, and rechecks each candidate immediately before `git worktree
-remove` without `--force`. It never deletes branches or prunes metadata. JSON from a
-preview is an inspection artifact, not a replayable authorization token. Concurrent
-external Git/filesystem activity cannot be made atomic with a CLI check; stop other
-writers before applying. A late change aborts further removals and reports any
-already completed removals honestly. No rollback is promised.
+- **conservative:** keep the existing policy: the worktree must be completely clean
+  (including no untracked or ignored files), and GitHub must confirm a terminal PR
+  for the exact current HEAD in the same repository, with no associated open PR or
+  open PR on the current branch
+- **balanced:** also remove completely clean worktrees without a terminal PR, but
+  only after complete, successful GitHub checks establish no associated open PR or
+  open PR on the current branch. This deliberately treats an unassociated clean
+  checkout as disposable. The HEAD and all local branch commits must remain
+  reachable from locally recorded remote refs; absence of a PR alone is insufficient
+- **aggressive:** use balanced PR/commit eligibility, and also permit discarding
+  tracked changes, untracked files, and ignored files. Applying this level requires
+  the separate `--discard-local-changes` acknowledgement on every invocation, even
+  if the current plan happens to contain only clean worktrees. Selecting aggressive
+  in config does **not** authorize data loss
 
-This is deliberately stricter than clean-repos's personal force-clean policy.
-No aggressive policy is implemented. Process-use detection is scoped to the current OS user (Linux /proc, macOS lsof).
+```sh
+# Preview a stricter or looser policy without modifying anything
+repoman clean --root ~/src --level balanced
+repoman clean --root ~/src --level aggressive --json
+
+# Apply a reviewed clean-worktree policy
+repoman clean --root ~/src --level balanced --apply
+
+# DANGER: permanently discard local file contents in eligible linked worktrees
+repoman clean --root ~/src --level aggressive --apply --discard-local-changes
+
+# Override a configured aggressive target back to the safe default
+repoman clean ~/src --level conservative --apply
+```
+
+The discard flag is rejected with conservative or balanced levels. It cannot be
+persisted in configuration. Human previews label the effective policy and flag
+planned file loss; JSON includes the policy and a per-item destructive indicator.
+A preview is not a saved plan: applying builds a fresh plan from current evidence.
+
+**Protections that no level overrides:** primary checkouts, paths outside the
+selected root, unknown Git or path identity, local-only committed work, stash,
+hidden-index flags (assume-unchanged/skip-worktree), submodules, locks, active Git
+operations, in-use checkouts/shared metadata, or incomplete process observation.
+Nested repositories and unsafe filesystem content are protected before aggressive
+removal. Branches are never deleted. A GitHub API failure, missing access,
+unsupported origin, or incomplete response is unknown evidence, never “no PR.”
+Remote tracking refs are not refreshed during cleanup.
+
+`--apply` validates the complete inventory and GitHub evidence again before any
+mutation and rechecks each candidate immediately before removal. Aggressive
+candidates additionally receive content snapshots of the worktree and index so
+changed local bytes or newly discovered unsafe content abort removal. Each
+candidate is limited to 100,000 entries, 256 directory levels, and 256 MiB of
+snapshot input; unreadable
+content, larger candidates, special files, nested mounts, and nested repositories
+are kept rather than bypassing inspection. Symlink targets are not followed. Non-destructive removal uses
+`git worktree remove`; acknowledged destructive removal may use one `--force`.
+Locks are never overridden with double force, and there is no shell deletion
+fallback or metadata pruning.
+
+Concurrent external Git/filesystem activity cannot be made atomic with a CLI
+check; stop other writers before applying. A late change aborts further removals
+and reports completed removals honestly. A failed attempted removal is marked
+`failed`, not assumed untouched. No rollback is promised.
+
+Process-use detection is scoped to the current OS user (Linux /proc, macOS lsof).
 It does not claim visibility into other users or prevent new processes starting
-after inspection. Actual observation errors protect candidates; stop other writers
-before applying. No elevated privileges are needed or recommended.
+after inspection. An in-use sibling checkout or shared Git metadata protects all
+worktrees of that repository. No elevated privileges are needed or recommended.
 
 ## Output and exit codes
 
@@ -144,10 +191,15 @@ All three commands return one JSON object with `schema_version: 1`, `command`,
 `dry_run`, `items` (always an array), and `errors` (always an array). Human and JSON
 renderers consume the same results. Item actions explain planned, skipped, or
 completed work; a skipped safety check is not a successful update/removal.
+Cleanup additionally emits `cleanup_policies` for every selected root, including
+empty roots, with `level` and the requested `discard_local_changes` flag. Each
+cleanup item includes its effective level and `destructive` indicator. These are
+additive schema-v1 fields; `dry_run` and item `action` distinguish plans from actual
+removals. A requested discard flag alone never means data was deleted.
 
 - `0`: completed inspection/action; intentional safety skips may remain
 - `1`: command/usage/runtime failure before a complete report
-- `2`: invalid target/config selection
+- `2`: invalid target/config selection or cleanup options
 - `3`: report emitted with operation or inspection errors (possibly partial work)
 - `130`: canceled by SIGINT/SIGTERM
 
@@ -164,7 +216,8 @@ make vuln
 make release-snapshot     # requires GoReleaser; local only
 ```
 
-Tests create isolated temporary Git repositories and fake remote responses. They
+CI runs the race-test suite on Linux and macOS, and cross-builds both CPU
+architectures. Tests create isolated temporary Git repositories and fake remote responses. They
 do not touch a user's clone registry or invoke the original cleanup scripts.
-No background service, task orchestration, editor integration, force cleanup,
-GitHub Enterprise support, or release installation is included.
+No background service, task orchestration, editor integration, primary-clone
+deletion, GitHub Enterprise support, or release installation is included.

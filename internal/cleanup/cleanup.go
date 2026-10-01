@@ -1,6 +1,7 @@
 // Package cleanup builds conservative worktree cleanup plans and applies them
 // only after revalidating the complete inventory. It never removes branches or
-// primary clones, prunes registrations, or uses git's force option.
+// primary clones or prunes registrations. Aggressive apply requires an explicit
+// acknowledgement before discarding local files with a single --force.
 package cleanup
 
 import (
@@ -26,10 +27,12 @@ const (
 
 // Result describes what happened to a worktree, or what a preview would do.
 type Result struct {
-	Path   string           `json:"path"`
-	Action string           `json:"action"`
-	Reason string           `json:"reason"`
-	State  repository.State `json:"state"`
+	Path        string           `json:"path"`
+	Action      string           `json:"action"`
+	Reason      string           `json:"reason"`
+	Level       Level            `json:"level"`
+	Destructive bool             `json:"destructive"`
+	State       repository.State `json:"state"`
 }
 
 type evidence struct {
@@ -44,6 +47,7 @@ type engine struct {
 	remove   func(context.Context, repository.State) error
 	includes []string
 	excludes []string
+	options  Options
 }
 
 // Run previews cleanup unless apply is explicitly true. A lookup or preflight
@@ -56,23 +60,45 @@ func Run(ctx context.Context, root string, apply bool) ([]Result, error) {
 // RunFiltered applies selection patterns to primary clone basenames. Excluded
 // repositories and all their linked worktrees remain protected.
 func RunFiltered(ctx context.Context, root string, apply bool, includes, excludes []string) ([]Result, error) {
+	return RunWithOptions(ctx, root, apply, includes, excludes, Options{})
+}
+
+// RunWithOptions previews or applies a level-specific cleanup plan. The legacy
+// Run and RunFiltered entry points always retain conservative behavior.
+func RunWithOptions(ctx context.Context, root string, apply bool, includes, excludes []string, options Options) ([]Result, error) {
+	options, err := options.validate(apply)
+	if err != nil {
+		return nil, err
+	}
 	return engine{
 		discover: repository.Discover,
 		inspect:  repository.Inspect,
-		lookup:   githubEvidence,
-		remove:   removeWorktree,
+		lookup: func(ctx context.Context, state repository.State) (evidence, error) {
+			if options.Level == Conservative {
+				return githubEvidence(ctx, state)
+			}
+			return lookupEvidenceForLevel(ctx, state, readPullRequests, options.Level)
+		},
+		remove: func(ctx context.Context, state repository.State) error {
+			return removeWorktreeWithOptions(ctx, state, options)
+		},
 		includes: includes,
 		excludes: excludes,
+		options:  options,
 	}.run(ctx, root, apply)
 }
 
 func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, error) {
+	options, err := e.options.validate(apply)
+	if err != nil {
+		return nil, err
+	}
 	for _, pattern := range append(append([]string(nil), e.includes...), e.excludes...) {
 		if _, err := filepath.Match(pattern, ""); err != nil {
 			return nil, fmt.Errorf("invalid repository selection pattern %q: %w", pattern, err)
 		}
 	}
-	root, err := filepath.Abs(root)
+	root, err = filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve cleanup root: %w", err)
 	}
@@ -81,6 +107,10 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 	if err != nil {
 		return nil, fmt.Errorf("inspect cleanup root: %w", err)
 	}
+	// Repository inspection canonicalizes checkout paths. Compare them with the
+	// same canonical root while retaining the originally supplied root identity
+	// so a changed alias or symlink still aborts apply.
+	root = rootIdentity.resolved
 	states, err := e.discover(ctx, root)
 	if err != nil {
 		return nil, fmt.Errorf("discover cleanup inventory: %w", err)
@@ -88,15 +118,16 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 	states = normalizeStates(states)
 	results := make([]Result, 0, len(states))
 	identities := make(map[string][]pathIdentity)
+	snapshots := make(map[string]contentSnapshot)
 	var lookupErrors []error
 	for _, state := range states {
 		if err := ctx.Err(); err != nil {
 			return blockPending(results, "cleanup canceled"), err
 		}
-		result := Result{Path: state.Path, Action: ActionKeep, State: state}
+		result := Result{Path: state.Path, Action: ActionKeep, Level: options.Level, State: state}
 		result.Reason = selectionProtection(states, state, e.includes, e.excludes)
 		if result.Reason == "" {
-			result.Reason = localProtection(root, state)
+			result.Reason = localProtectionForLevel(root, state, options.Level)
 		}
 		if result.Reason == "" {
 			result.Reason = sharedProtection(states, state)
@@ -125,6 +156,16 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 			results = append(results, result)
 			continue
 		}
+		if options.Level == Aggressive {
+			snapshot, snapshotErr := snapshotContent(ctx, state)
+			if snapshotErr != nil {
+				result.Reason = "local content safety check failed: " + snapshotErr.Error()
+				lookupErrors = append(lookupErrors, fmt.Errorf("inspect content for %q: %w", state.Path, snapshotErr))
+				results = append(results, result)
+				continue
+			}
+			snapshots[state.Path] = snapshot
+		}
 		proof, lookupErr := e.lookup(ctx, state)
 		if lookupErr != nil {
 			result.Reason = "GitHub PR lookup failed; cleanup blocked"
@@ -133,6 +174,10 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 			result.Reason = proof.reason
 			if proof.eligible {
 				result.Action = ActionWouldRemove
+				result.Destructive = hasLocalContent(state)
+				if result.Destructive {
+					result.Reason += "; will permanently discard modified, staged, untracked, and ignored files present"
+				}
 				identities[state.Path] = []pathIdentity{identity, commonIdentity, gitIdentity}
 			}
 		}
@@ -174,6 +219,16 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 			return blockPending(results, "worktree path identity changed"), fmt.Errorf("revalidate %q: %w", result.Path, err)
 		}
 	}
+	// Hash all aggressive candidates before the first deletion, then again at
+	// each deletion. Boolean status alone cannot detect new edits to dirty files.
+	for _, result := range results {
+		if result.Action != ActionWouldRemove || options.Level != Aggressive {
+			continue
+		}
+		if err := snapshots[result.Path].validate(ctx, result.State); err != nil {
+			return blockPending(results, "local content changed; rerun preview"), err
+		}
+	}
 	for i := range results {
 		if results[i].Action != ActionWouldRemove {
 			continue
@@ -188,11 +243,19 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 			return blockPending(results, "worktree path identity changed"), err
 		}
 		freshState := normalizeState(e.inspect(ctx, results[i].Path))
-		if !reflect.DeepEqual(results[i].State, freshState) || localProtection(root, freshState) != "" {
+		if !reflect.DeepEqual(results[i].State, freshState) || localProtectionForLevel(root, freshState, options.Level) != "" {
 			return blockPending(results, "worktree changed; rerun preview"), fmt.Errorf("worktree %q changed immediately before removal", results[i].Path)
 		}
 		if err := validateIdentities(identities[results[i].Path]); err != nil {
 			return blockPending(results, "worktree path identity changed"), err
+		}
+		if options.Level == Aggressive {
+			if err := snapshots[results[i].Path].validate(ctx, freshState); err != nil {
+				return blockPending(results, "local content changed; rerun preview"), err
+			}
+			if err := validateIdentities(identities[results[i].Path]); err != nil {
+				return blockPending(results, "worktree path identity changed"), err
+			}
 		}
 		if err := e.remove(ctx, freshState); err != nil {
 			results[i].Action = ActionFailed
@@ -200,7 +263,13 @@ func (e engine) run(ctx context.Context, root string, apply bool) ([]Result, err
 			return blockPending(results, "cleanup stopped after git refused removal"), fmt.Errorf("remove worktree %q: %w", results[i].Path, err)
 		}
 		results[i].Action = ActionRemoved
-		results[i].Reason = "removed clean linked worktree with verified terminal PR"
+		if results[i].Destructive {
+			results[i].Reason = "removed linked worktree and permanently discarded its local files after verified PR and content checks"
+		} else if options.Level == Conservative {
+			results[i].Reason = "removed clean linked worktree with verified terminal PR"
+		} else {
+			results[i].Reason = "removed clean linked worktree after verifying no open PR"
+		}
 	}
 	return results, nil
 }
@@ -209,6 +278,7 @@ func blockPending(results []Result, reason string) []Result {
 	for i := range results {
 		if results[i].Action == ActionWouldRemove {
 			results[i].Action = ActionKeep
+			results[i].Destructive = false
 			results[i].Reason = reason
 		}
 	}
@@ -271,7 +341,7 @@ func validateIdentities(identities []pathIdentity) error {
 	return nil
 }
 
-func localProtection(root string, state repository.State) string {
+func localProtectionForLevel(root string, state repository.State, level Level) string {
 	switch {
 	case state.Primary:
 		return "primary clone is protected"
@@ -283,11 +353,11 @@ func localProtection(root string, state repository.State) string {
 		return "repository identity is incomplete"
 	case state.Locked:
 		return "worktree is locked"
-	case state.Dirty:
+	case state.Dirty && level != Aggressive:
 		return "worktree has modified or staged files"
-	case state.Untracked:
+	case state.Untracked && level != Aggressive:
 		return "worktree has untracked files"
-	case state.Ignored:
+	case state.Ignored && level != Aggressive:
 		return "worktree has ignored files"
 	case state.Stash:
 		return "repository has stashed work"
@@ -384,8 +454,26 @@ func (identity pathIdentity) validate() error {
 }
 
 func removeWorktree(ctx context.Context, state repository.State) error {
-	// Git remains the final safety gate. Never add --force or a shell fallback.
-	cmd := exec.CommandContext(ctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath="+os.DevNull, "--git-dir="+state.CommonDir, "worktree", "remove", "--", state.Path) // #nosec G204 -- fixed executable and arguments, without a shell.
+	return removeWorktreeWithOptions(ctx, state, Options{})
+}
+
+func hasLocalContent(state repository.State) bool {
+	return state.Dirty || state.Untracked || state.Ignored
+}
+
+func removeWorktreeWithOptions(ctx context.Context, state repository.State, options Options) error {
+	options, err := options.validate(true)
+	if err != nil {
+		return err
+	}
+	// A single force is only allowed for an explicitly acknowledged aggressive
+	// candidate with local content. Never double-force locks or use a shell fallback.
+	args := []string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull, "--git-dir=" + state.CommonDir, "worktree", "remove"}
+	if options.Level == Aggressive && hasLocalContent(state) {
+		args = append(args, "--force")
+	}
+	args = append(args, "--", state.Path)
+	cmd := exec.CommandContext(ctx, "git", args...) // #nosec G204 -- fixed executable, validated options and paths; no shell.
 	for _, item := range os.Environ() {
 		if !strings.HasPrefix(item, "GIT_") {
 			cmd.Env = append(cmd.Env, item)

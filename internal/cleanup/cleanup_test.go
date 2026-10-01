@@ -15,6 +15,11 @@ import (
 
 func syntheticState(t *testing.T, root, name string) repository.State {
 	t.Helper()
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root = canonical
 	path := filepath.Join(root, name)
 	common := filepath.Join(root, "primary", ".git")
 	gitDir := filepath.Join(common, "worktrees", name)
