@@ -33,7 +33,10 @@ func cleanupCLIGit(t *testing.T, path string, args ...string) string {
 
 func cleanupCLIFixture(t *testing.T) (string, string) {
 	t.Helper()
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	primary := filepath.Join(root, "primary")
 	linked := filepath.Join(root, "linked")
 	if err := os.Mkdir(primary, 0700); err != nil {

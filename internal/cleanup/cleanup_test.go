@@ -290,9 +290,18 @@ func testGit(t *testing.T, directory string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func realWorktree(t *testing.T) (string, repository.State) {
 	t.Helper()
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	primary := filepath.Join(root, "primary")
 	if err := os.Mkdir(primary, 0o700); err != nil {
 		t.Fatal(err)

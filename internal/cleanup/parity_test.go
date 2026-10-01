@@ -110,7 +110,7 @@ func TestAggressiveRealLocalDataMatrix(t *testing.T) {
 
 func TestAggressiveRegisteredOutsideRootAndEmptyPrimary(t *testing.T) {
 	root, s := realWorktree(t)
-	outside := filepath.Join(t.TempDir(), "outside-worktree")
+	outside := filepath.Join(canonicalTempDir(t), "outside-worktree")
 	testGit(t, filepath.Join(root, "primary"), "worktree", "move", s.Path, outside)
 	empty := filepath.Join(root, "empty-primary")
 	if err := os.Mkdir(empty, 0700); err != nil {
@@ -369,7 +369,7 @@ func TestAggressiveOptionalDiagnosticsDoNotBecomeIdentityFailures(t *testing.T) 
 }
 
 func TestBareAnchorDiscoversAndRemovesRegisteredWorktree(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	bare := filepath.Join(root, "anchor.git")
 	if err := os.Mkdir(bare, 0700); err != nil {
 		t.Fatal(err)
@@ -377,7 +377,7 @@ func TestBareAnchorDiscoversAndRemovesRegisteredWorktree(t *testing.T) {
 	testGit(t, bare, "init", "--bare", "-b", "main")
 	testGit(t, bare, "config", "user.name", "Fixture")
 	testGit(t, bare, "config", "user.email", "fixture@example.invalid")
-	outside := filepath.Join(t.TempDir(), "bare-linked")
+	outside := filepath.Join(canonicalTempDir(t), "bare-linked")
 	testGit(t, bare, "worktree", "add", "--orphan", "-b", "topic", outside)
 	if err := os.WriteFile(filepath.Join(outside, "tracked.txt"), []byte("bare-anchor fixture"), 0600); err != nil {
 		t.Fatal(err)
@@ -389,13 +389,23 @@ func TestBareAnchorDiscoversAndRemovesRegisteredWorktree(t *testing.T) {
 	if err != nil || len(results) != 2 {
 		t.Fatalf("results=%+v err=%v", results, err)
 	}
+	foundBare, foundOutside := false, false
 	for _, r := range results {
-		if r.Path == bare && (!r.State.Bare || !r.State.Primary || r.Action != ActionKeep) {
-			t.Fatalf("bare anchor not protected: %+v", r)
+		switch r.Path {
+		case bare:
+			foundBare = true
+			if !r.State.Bare || !r.State.Primary || r.Action != ActionKeep {
+				t.Fatalf("bare anchor not protected: %+v", r)
+			}
+		case outside:
+			foundOutside = true
+			if r.Action != ActionRemoved {
+				t.Fatalf("bare linked worktree not removed: %+v", r)
+			}
 		}
-		if r.Path == outside && r.Action != ActionRemoved {
-			t.Fatalf("bare linked worktree not removed: %+v", r)
-		}
+	}
+	if !foundBare || !foundOutside {
+		t.Fatalf("missing expected bare/worktree records: %+v", results)
 	}
 	testGit(t, bare, "show-ref", "--verify", "refs/heads/topic")
 }
