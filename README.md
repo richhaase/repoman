@@ -23,6 +23,24 @@ make build
 make check
 ```
 
+## Homebrew distribution
+
+After an approved stable release has published its cask and assets:
+
+```sh
+brew install --cask richhaase/tap/repoman
+brew upgrade --cask repoman
+```
+
+The generated cask installs the `repoman` binary and declares `git` and `gh`
+dependencies. The publishing destination is the existing
+[richhaase/tap](https://github.com/richhaase/homebrew-tap) repository; GoReleaser
+updates its default branch directly, following the Bigboard/Plonk/ACR pattern.
+There is no hand-maintained formula or tap pull-request publisher.
+
+A snapshot or a merged setup PR is **not** an installable release. No version tag
+or release is created by the validation commands below.
+
 ## Quick start
 
 ```sh
@@ -219,6 +237,62 @@ removals. A requested discard flag alone never means data was deleted.
 Consumers must check both exit status and individual item actions. Schema additions
 may be backward-compatible; incompatible changes will increment `schema_version`.
 
+## Release setup and privacy
+
+The ordinary public-tap download path requires **public release assets**. This
+workflow therefore refuses to publish while the Repoman repository is private or
+its visibility cannot be verified. Both the workflow preflight and GoReleaser
+before hook check current metadata for the exact Repoman repository before
+creating a release, signing binaries, or writing the public cask. It never changes
+repository visibility itself. Choose and explicitly authorize a public distribution
+model before the first release. Keeping source private requires a different,
+reviewed authenticated-download or separate-artifact-repository design; do not
+remove the privacy guard just to work around an installation failure.
+
+Before an authorized tag release, the repository needs these Actions secrets
+(reference names only; never commit their values):
+
+- `HOMEBREW_TAP_GITHUB_TOKEN`: an approved credential with access to update the tap
+- `QUILL_SIGN_P12` and `QUILL_SIGN_PASSWORD`: the approved base64-encoded P12
+  macOS signing identity and its password
+- `QUILL_NOTARY_KEY`, `QUILL_NOTARY_KEY_ID`, and `QUILL_NOTARY_ISSUER`: approved
+  Apple notarization credentials (`QUILL_NOTARY_KEY` is the base64-encoded P8 key)
+- `GITHUB_TOKEN` is supplied by GitHub Actions for this repository's release
+
+The default Actions token cannot update another repository's tap. Existing secret
+names in a different repository do not automatically make them available here.
+Creating credentials, expanding their access, or configuring them for this
+repository is a separate authorized setup step. The preflight reports missing
+names only and fails before publication; it never prints values.
+
+The release workflow runs on explicitly pushed `v*` tags and uses pinned
+GoReleaser 2.18.2. It builds Linux/macOS AMD64/ARM64 archives, signs and notarizes
+macOS binaries, computes SHA-256 checksums, uploads GitHub release assets, and
+pushes the generated cask directly to the tap. `skip_upload: auto` keeps
+prereleases out of the stable Homebrew cask. Do not create an arbitrary version
+just to test the workflow; choose the actual release version deliberately after
+CI and the distribution/credential prerequisites are satisfied.
+
+Safe validation requires GoReleaser 2.18.2 and Python 3:
+
+```sh
+make release-check       # synthetic preflight tests and GoReleaser schema check
+make release-snapshot    # local build/package/cask generation; no publishing
+```
+
+CI performs the same snapshot checks with read-only repository permission and no
+release/signing credentials. It verifies all four archive targets, packaged
+binary/README/LICENSE, executable modes, cask URLs and matching checksums, and
+Homebrew dependencies. Snapshots skip signing, notarization and publishing, and
+are not uploaded as workflow artifacts. Passing these checks does not prove tap
+write access, Apple credential validity, or installation from a real release.
+Only run a real release after those prerequisites are explicitly approved. The
+guarded workflow is the normal route; a live local GoReleaser invocation runs the
+same current-visibility and credential-presence check instead of bypassing it.
+
+References: [GoReleaser casks](https://goreleaser.com/customization/publish/homebrew_casks/)
+and [snapshot behavior](https://goreleaser.com/customization/publish/snapshots/).
+
 ## Development and scope
 
 ```sh
@@ -226,11 +300,13 @@ make fmt
 make check                # fmt-check, vet, pinned lint, race tests
 make build
 make vuln
-make release-snapshot     # requires GoReleaser; local only
+make release-check        # release safeguards and configuration
+make release-snapshot     # requires GoReleaser 2.18.2; local only
 ```
 
 CI runs the race-test suite on Linux and macOS, and cross-builds both CPU
 architectures. Tests create isolated temporary Git repositories and fake remote responses. They
 do not touch a user's clone registry or invoke the original cleanup scripts.
 No background service, task orchestration, editor integration, primary-clone
-deletion, GitHub Enterprise support, or release installation is included.
+deletion or GitHub Enterprise support is included. Release installation is a
+separate step after a real, authorized release has been published.
