@@ -75,6 +75,55 @@ func TestConfigEnvironmentAndEmptyList(t *testing.T) {
 	}
 }
 
+func TestConfigFetchControlsRoundTripAndPreservation(t *testing.T) {
+	path, dir := filepath.Join(t.TempDir(), "config.json"), t.TempDir()
+	for _, step := range []struct {
+		name  string
+		flags []string
+		scope string
+		prune bool
+	}{
+		{name: "new legacy defaults"},
+		{name: "opt in", flags: []string{"--fetch-scope", "all", "--prune"}, scope: "all", prune: true},
+		{name: "preserve omitted", scope: "all", prune: true},
+		{name: "disable only prune", flags: []string{"--prune=false"}, scope: "all"},
+		{name: "override only scope", flags: []string{"--fetch-scope", "origin"}, scope: "origin"},
+		{name: "enable only prune", flags: []string{"--prune=true"}, scope: "origin", prune: true},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			args := append([]string{"config", "add", dir, "--config", path, "--owner", "me", "--json"}, step.flags...)
+			out, diag, err := executeCommand(t, t.Context(), args...)
+			if err != nil || diag != "" {
+				t.Fatalf("add=%s,%s,%v", out, diag, err)
+			}
+			var added config.Config
+			if err := json.Unmarshal([]byte(out), &added); err != nil || len(added.Targets) != 1 || added.Targets[0].FetchScope != step.scope || added.Targets[0].Prune != step.prune {
+				t.Fatalf("saved=%s,%v", out, err)
+			}
+			listed, diag, err := executeCommand(t, t.Context(), "config", "list", "--config", path, "--json")
+			if err != nil || diag != "" || listed != out {
+				t.Fatalf("list changed values: added=%s listed=%s diag=%s err=%v", out, listed, diag, err)
+			}
+			loaded, err := config.Load(path)
+			if err != nil || loaded.Targets[0].FetchScope != step.scope || loaded.Targets[0].Prune != step.prune {
+				t.Fatalf("loaded=%+v,%v", loaded, err)
+			}
+			human, _, err := executeCommand(t, t.Context(), "config", "list", "--config", path)
+			scope := step.scope
+			if scope == "" {
+				scope = "origin"
+			}
+			prune := "false"
+			if step.prune {
+				prune = "true"
+			}
+			if err != nil || !strings.Contains(human, "fetch_scope: "+scope+"   prune: "+prune) {
+				t.Fatalf("human list=%s,%v", human, err)
+			}
+		})
+	}
+}
+
 func TestConfigAuthenticatedOwnerFallback(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture")
@@ -118,6 +167,8 @@ func TestInvalidConfigFlagsDoNotWrite(t *testing.T) {
 		{"--exclude", ""},
 		{"--cleanup-level", "reckless"},
 		{"--cleanup-level", ""},
+		{"--fetch-scope", "invalid"},
+		{"--fetch-scope", ""},
 		{"--excludes-file", ""},
 	} {
 		t.Run(strings.Join(flags, " "), func(t *testing.T) {

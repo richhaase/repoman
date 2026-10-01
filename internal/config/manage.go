@@ -20,9 +20,24 @@ func List(path string) (Config, error) {
 }
 
 // Register replaces a target's sync settings and appends it in configuration
-// order, matching sync-repos add. An existing cleanup level is retained unless
-// target supplies one. Registration does not create the target directory.
+// order, matching sync-repos add. Existing cleanup and fetch settings are retained
+// when omitted. Use RegisterWithOptions to explicitly disable pruning.
+// Registration does not create the target directory.
 func Register(path string, target syncer.Target) (Config, error) {
+	return RegisterWithOptions(path, target, RegisterOptions{})
+}
+
+// RegisterOptions distinguishes an explicit pruning choice from an omitted one.
+type RegisterOptions struct {
+	Prune *bool
+}
+
+// RegisterWithOptions registers a target with optional explicit overrides.
+// A non-nil Prune overrides target.Prune, including an explicit false.
+func RegisterWithOptions(path string, target syncer.Target, options RegisterOptions) (Config, error) {
+	if options.Prune != nil {
+		target.Prune = *options.Prune
+	}
 	var err error
 	target.Dir, err = Normalize(target.Dir)
 	if err != nil {
@@ -46,6 +61,12 @@ func Register(path string, target syncer.Target) (Config, error) {
 			if dir == target.Dir {
 				if target.CleanupLevel == "" {
 					target.CleanupLevel = existing.CleanupLevel
+				}
+				if target.FetchScope == "" {
+					target.FetchScope = existing.FetchScope
+				}
+				if options.Prune == nil && !target.Prune {
+					target.Prune = existing.Prune
 				}
 				continue
 			}

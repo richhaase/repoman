@@ -51,16 +51,16 @@ func TestRegisterEmptyAndRemoveLast(t *testing.T) {
 func TestRegisterPreservesUntouchedValuesAndReplacementOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	t.Setenv("HOME", t.TempDir())
-	writeConfig(t, path, `{"targets":[{"dir":"~/first","owner":"old","days":10,"events":true,"includes":["old*"],"excludes":["skip*"],"cleanup_level":"balanced"},{"dir":"~/second","owner":"another","days":0,"events":true,"includes":["a*"],"excludes":["b*"],"cleanup_level":"aggressive"}]}`)
+	writeConfig(t, path, `{"targets":[{"dir":"~/first","owner":"old","days":10,"events":true,"includes":["old*"],"excludes":["skip*"],"cleanup_level":"balanced","fetch_scope":"all","prune":true},{"dir":"~/second","owner":"another","days":0,"events":true,"includes":["a*"],"excludes":["b*"],"cleanup_level":"aggressive","fetch_scope":"origin","prune":true}]}`)
 	c, err := Register(path, syncer.Target{Dir: "~/first", Owner: "new", Days: 45, Includes: []string{"new*"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	untouched, replaced := c.Targets[0], c.Targets[1]
-	if untouched.Dir != "~/second" || untouched.Days != 0 || untouched.Owner != "another" || untouched.Events == nil || !*untouched.Events || untouched.CleanupLevel != "aggressive" || strings.Join(untouched.Includes, ",") != "a*" || strings.Join(untouched.Excludes, ",") != "b*" {
+	if untouched.Dir != "~/second" || untouched.Days != 0 || untouched.Owner != "another" || untouched.Events == nil || !*untouched.Events || untouched.CleanupLevel != "aggressive" || untouched.FetchScope != "origin" || !untouched.Prune || strings.Join(untouched.Includes, ",") != "a*" || strings.Join(untouched.Excludes, ",") != "b*" {
 		t.Fatalf("untouched target changed: %+v", untouched)
 	}
-	if replaced.Dir != filepath.Join(os.Getenv("HOME"), "first") || replaced.Owner != "new" || replaced.Days != 45 || replaced.CleanupLevel != "balanced" || replaced.Events == nil || *replaced.Events || len(replaced.Excludes) != 0 || strings.Join(replaced.Includes, ",") != "new*" {
+	if replaced.Dir != filepath.Join(os.Getenv("HOME"), "first") || replaced.Owner != "new" || replaced.Days != 45 || replaced.CleanupLevel != "balanced" || replaced.FetchScope != "all" || !replaced.Prune || replaced.Events == nil || *replaced.Events || len(replaced.Excludes) != 0 || strings.Join(replaced.Includes, ",") != "new*" {
 		t.Fatalf("replacement=%+v", replaced)
 	}
 	c, err = Register(path, syncer.Target{Dir: "~/first", Owner: "new", Days: 45, CleanupLevel: "conservative"})
@@ -69,11 +69,31 @@ func TestRegisterPreservesUntouchedValuesAndReplacementOrder(t *testing.T) {
 	}
 }
 
+func TestRegisterExplicitFetchOverrides(t *testing.T) {
+	path, dir := filepath.Join(t.TempDir(), "config.json"), t.TempDir()
+	target := syncer.Target{Dir: dir, Owner: "me", Days: 45, FetchScope: "all", Prune: true}
+	if _, err := Register(path, target); err != nil {
+		t.Fatal(err)
+	}
+	noPrune := false
+	target.FetchScope, target.Prune = "origin", false
+	c, err := RegisterWithOptions(path, target, RegisterOptions{Prune: &noPrune})
+	if err != nil || c.Targets[0].FetchScope != "origin" || c.Targets[0].Prune {
+		t.Fatalf("explicit false override=%+v,%v", c, err)
+	}
+	target.Prune = true
+	c, err = Register(path, target)
+	if err != nil || !c.Targets[0].Prune {
+		t.Fatalf("explicit true target=%+v,%v", c, err)
+	}
+}
+
 func TestConfigMutationRejectsInvalidWithoutLosingData(t *testing.T) {
 	for _, initial := range []string{
 		`{"future":true,"targets":[]}`,
 		`{"targets":[{"dir":"src","owner":"me","future":true}]}`,
 		`{"targets":[{"dir":"src","cleanup_level":"reckless"}]}`,
+		`{"targets":[{"dir":"src","fetch_scope":"invalid"}]}`,
 		`{"targets":[{"dir":"src"},{"dir":"./src"}]}`,
 		`{"targets":[]} {}`,
 		`null`,

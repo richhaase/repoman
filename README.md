@@ -71,6 +71,8 @@ On both macOS and Linux, configuration lookup uses this order:
       "owner": "richhaase",
       "days": 45,
       "events": false,
+      "fetch_scope": "origin",
+      "prune": false,
       "cleanup_level": "aggressive",
       "includes": [],
       "excludes": ["prototype-*"]
@@ -119,8 +121,9 @@ repoman config remove ~/work
 ```
 
 `add` registers or replaces a target and appends it in config order. It replaces
-that target's sync settings; an existing `cleanup_level` is retained unless
-`--cleanup-level` overrides it. `remove` changes registration only; it does not
+that target's activity/filter settings. Existing `fetch_scope`, `prune`, and
+`cleanup_level` values are retained unless their corresponding flags override
+them (`--fetch-scope`, `--prune`, and `--cleanup-level`). `remove` changes registration only; it does not
 delete clones or worktrees. `list --json` emits the configuration object for reuse.
 Exclusion files trim whitespace and ignore blank lines and lines starting with
 `#`; their patterns are appended to supplied exclusions.
@@ -134,9 +137,11 @@ are preserved. Status, sync, and clean never rewrite the registry.
 
 Select non-archived repositories with pushes inside the activity window. Fetch
 all pages of GitHub results, without the original script's 500-repository cap.
-Clone missing active repositories. For existing active primary clones, fetch all
-configured remotes and prune obsolete remote refs before deciding whether to
-update the checkout.
+Clone missing active repositories. For existing active primary clones, fetch
+from `origin` using its configured fetch refspecs before deciding whether to
+update the checkout. A normal clone fetches all origin branches, not just its
+default branch. Existing customized or single-branch refspecs remain respected.
+Pruning is off by default, even if Git configuration enables it.
 
 A clean default branch fast-forwards. Dirty/untracked files, another branch,
 detached HEAD, or ahead/diverged history leave the checkout as-is after fetching.
@@ -145,7 +150,27 @@ No default branch or missing origin default ref yields a fetch-only result.
 Destinations must still be the expected primary clone with the expected origin;
 identity errors are never treated as permission to modify another repository.
 
+Fetch scope, pruning, checkout reset, and deletion are separate choices:
+
+- `fetch_scope` defaults to `"origin"`; `"all"` uses Git's all-remotes fetch,
+  honoring each remote's `skipFetchAll` setting
+- `prune` defaults to `false`; `true` removes obsolete remote-tracking refs during
+  fetch under normal branch refspecs. Ambient tag-pruning settings are disabled.
+  Custom refspecs remain authoritative: pruning an explicitly configured tag or
+  other destination namespace can delete refs there. Working files are unchanged
+- `--fetch-scope origin|all` and `--prune[=true|false]` override selected targets'
+  configuration for this invocation. `--prune=false` overrides a saved `true`
+- `--force` resets the active checkout; `--cleanup` permits inactive primary
+  eviction. Both are invocation-only and are never inferred from fetch settings
+- `cleanup_level` and `clean --level` control linked-worktree cleanup separately
+
 ```sh
+# Persist origin-only fetch with pruning enabled for one target
+repoman config add ~/src --fetch-scope origin --prune
+
+# Preview all-remotes fetch, without pruning, regardless of saved settings
+repoman sync ~/src --fetch-scope all --prune=false --dry-run
+
 # Preview an explicit reset of active clones to their origin default branch
 repoman sync ~/src --force --dry-run
 
@@ -244,7 +269,8 @@ unavailable. Non-repository directories are not recursively scanned.
 
 Status/sync/clean emit one JSON object with `schema_version: 1`, `command`,
 `dry_run`, `items` (always an array), and `errors` (always an array). Human and JSON
-renderers consume the same results. Cleanup also reports effective policies for
+renderers consume the same results. Sync reports effective fetch scope, pruning,
+force, and inactive-clone cleanup controls for every selected target. Cleanup also reports effective policies for
 every selected root, including empty roots, and per-item destructive indicators. Non-empty `warnings` arrays
 report incomplete best-effort process visibility on cleanup items and the command
 envelope. Each state reflects its latest observation; warnings can also reflect

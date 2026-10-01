@@ -363,7 +363,7 @@ func TestDryRunExistingCloneOnlyReads(t *testing.T) {
 	}
 }
 
-func TestAllRemotesFetchPruneAndFastForward(t *testing.T) {
+func TestOriginFetchWithoutPruneAndFastForward(t *testing.T) {
 	dir, state := cloneState(t)
 	var calls []call
 	e := engine{inspect: func(context.Context, string) (repository.State, error) { return state, nil }, command: fakeCommands(t, dir, &calls)}
@@ -375,7 +375,7 @@ func TestAllRemotesFetchPruneAndFastForward(t *testing.T) {
 	for _, c := range calls {
 		if c.args[0] == "fetch" {
 			fetches++
-			want := []string{"fetch", "--all", "--prune", "--quiet"}
+			want := []string{"fetch", "--no-all", "--no-prune", "--no-prune-tags", "--quiet", "origin"}
 			if !reflect.DeepEqual(c.args, want) {
 				t.Fatalf("unsafe fetch %v", c.args)
 			}

@@ -101,6 +101,9 @@ func validate(c Config, allowEmpty bool) (Config, error) {
 	seen := map[string]bool{}
 	for i := range c.Targets {
 		t := &c.Targets[i]
+		if _, scopeErr := syncer.ParseFetchScope(t.FetchScope); scopeErr != nil {
+			return c, fmt.Errorf("target %q fetch_scope: %w", t.Dir, scopeErr)
+		}
 		if _, levelErr := cleanup.ParseLevel(t.CleanupLevel); levelErr != nil {
 			return c, fmt.Errorf("target %q cleanup_level: %w", t.Dir, levelErr)
 		}

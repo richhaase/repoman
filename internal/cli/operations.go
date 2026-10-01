@@ -34,6 +34,15 @@ type envelope struct {
 	Errors          []string        `json:"errors"`
 	Warnings        []string        `json:"warnings,omitempty"`
 	CleanupPolicies []cleanupPolicy `json:"cleanup_policies,omitempty"`
+	SyncPolicies    []syncPolicy    `json:"sync_policies,omitempty"`
+}
+
+type syncPolicy struct {
+	Root       string `json:"root"`
+	FetchScope string `json:"fetch_scope"`
+	Prune      bool   `json:"prune"`
+	Force      bool   `json:"force"`
+	Cleanup    bool   `json:"cleanup"`
 }
 
 type cleanupPolicy struct {
@@ -220,12 +229,29 @@ func newStatusCmd() *cobra.Command {
 	return cmd
 }
 func newSyncCmd() *cobra.Command {
+	return newSyncCmdWithRunner(syncer.RunWithOptions)
+}
+
+func validateFetchScopeFlag(scope string) error {
+	if scope == "" {
+		return fmt.Errorf("--fetch-scope cannot be empty; use origin or all")
+	}
+	_, err := syncer.ParseFetchScope(scope)
+	return err
+}
+
+func newSyncCmdWithRunner(run func(context.Context, syncer.Target, syncer.Options) ([]syncer.Result, error)) *cobra.Command {
 	var o options
-	var owner, excludesFile string
+	var owner, excludesFile, fetchScope string
 	var days int
-	var noEvents, dryRun, force, cleanupInactive bool
+	var noEvents, dryRun, force, cleanupInactive, prune bool
 	var includes, excludes []string
 	cmd := &cobra.Command{Use: "sync [DIR]", Short: "Clone and update active repositories; optionally force checkout or clean inactive clones", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("fetch-scope") {
+			if err := validateFetchScopeFlag(fetchScope); err != nil {
+				return &ExitError{Code: 2, Err: err}
+			}
+		}
 		ts, e := selection(cmd, o, args)
 		if e != nil {
 			return e
@@ -249,6 +275,11 @@ func newSyncCmd() *cobra.Command {
 		results := []syncer.Result{}
 		errs := []string{}
 		lines := []string{}
+		policies := make([]syncPolicy, 0, len(ts))
+		syncOptions := syncer.Options{DryRun: dryRun, Force: force, Cleanup: cleanupInactive, FetchScope: fetchScope}
+		if cmd.Flags().Changed("prune") {
+			syncOptions.Prune = &prune
+		}
 		for _, t := range ts {
 			if cmd.Flags().Changed("owner") {
 				t.Owner = owner
@@ -264,8 +295,23 @@ func newSyncCmd() *cobra.Command {
 				t.Includes = includes
 			}
 			t.Excludes = append(append(append([]string{}, t.Excludes...), excludes...), fileExcludes...)
+			scope := t.FetchScope
+			if fetchScope != "" {
+				scope = fetchScope
+			}
+			scope, _ = syncer.ParseFetchScope(scope) // Config and explicit flags were validated before any target runs.
+			effectivePrune := t.Prune
+			if syncOptions.Prune != nil {
+				effectivePrune = *syncOptions.Prune
+			}
+			policies = append(policies, syncPolicy{Root: t.Dir, FetchScope: scope, Prune: effectivePrune, Force: force, Cleanup: cleanupInactive})
+			phase := "apply"
+			if dryRun {
+				phase = "preview"
+			}
+			lines = append(lines, fmt.Sprintf("sync %s | fetch_scope=%s | prune=%t | force=%t | cleanup=%t | root=%q", phase, scope, effectivePrune, force, cleanupInactive, t.Dir))
 			slog.DebugContext(cmd.Context(), "syncing target", "root", t.Dir, "owner", t.Owner, "dry_run", dryRun)
-			rs, e := syncer.RunWithOptions(cmd.Context(), t, syncer.Options{DryRun: dryRun, Force: force, Cleanup: cleanupInactive})
+			rs, e := run(cmd.Context(), t, syncOptions)
 			results = append(results, rs...)
 			if e != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", t.Dir, e))
@@ -274,7 +320,10 @@ func newSyncCmd() *cobra.Command {
 				lines = append(lines, fmt.Sprintf("%-14s %s: %s", r.Action, r.Name, r.Reason))
 			}
 		}
-		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs}, lines)
+		if len(results) == 0 && len(errs) == 0 {
+			lines = append(lines, "No repositories found")
+		}
+		return output(cmd, o, envelope{SchemaVersion: 1, Command: "sync", DryRun: dryRun, Items: results, Errors: errs, SyncPolicies: policies}, lines)
 	}}
 	bind(cmd, &o)
 	cmd.Flags().StringVarP(&owner, "owner", "o", "", "GitHub user or organization (defaults to authenticated gh user)")
@@ -284,6 +333,8 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&includes, "include", nil, "repository-name glob to include (repeatable)")
 	cmd.Flags().StringArrayVarP(&excludes, "exclude", "e", nil, "repository-name glob to exclude (repeatable; wins over includes)")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "discard local changes and force the default branch to origin (destructive)")
+	cmd.Flags().StringVar(&fetchScope, "fetch-scope", "", "fetch origin (default) or all configured remotes; overrides target config")
+	cmd.Flags().BoolVar(&prune, "prune", false, "prune stale remote-tracking refs when fetching; overrides target config (use --prune=false to disable)")
 	cmd.Flags().BoolVarP(&cleanupInactive, "cleanup", "c", false, "remove inactive primary clones without uncommitted or untracked changes (destructive)")
 	cmd.Flags().StringVar(&excludesFile, "excludes-file", "", "read exclude patterns from FILE (blank lines and # comments ignored)")
 	return cmd

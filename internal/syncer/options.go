@@ -8,6 +8,69 @@ import (
 	"strings"
 )
 
+// ParseFetchScope validates a fetch scope and resolves an empty value to origin.
+func ParseFetchScope(scope string) (string, error) {
+	if scope == "" {
+		return "origin", nil
+	}
+	if scope != "origin" && scope != "all" {
+		return "", fmt.Errorf("fetch scope must be origin or all, got %q", scope)
+	}
+	return scope, nil
+}
+
+func fetchOptions(target Target, options Options) (string, bool, error) {
+	if _, err := ParseFetchScope(target.FetchScope); err != nil {
+		return "", false, err
+	}
+	scope := options.FetchScope
+	if scope == "" {
+		scope = target.FetchScope
+	}
+	scope, err := ParseFetchScope(scope)
+	if err != nil {
+		return "", false, err
+	}
+	prune := target.Prune
+	if options.Prune != nil {
+		prune = *options.Prune
+	}
+	return scope, prune, nil
+}
+
+func fetchArgs(scope string, prune bool) []string {
+	args := []string{"fetch"}
+	if scope == "all" {
+		args = append(args, "--all")
+	} else {
+		args = append(args, "--no-all")
+	}
+	if prune {
+		args = append(args, "--prune")
+	} else {
+		args = append(args, "--no-prune")
+	}
+	// Tag-pruning config must not broaden branch pruning. Explicit configured
+	// tag refspecs are still respected, as with ordinary git fetch.
+	args = append(args, "--no-prune-tags", "--quiet")
+	if scope == "origin" {
+		// No branch refspec narrows the configured origin fetch refspecs.
+		args = append(args, "origin")
+	}
+	return args
+}
+
+func fetchDescription(scope string, prune bool) string {
+	description := "origin"
+	if scope == "all" {
+		description = "all remotes"
+	}
+	if prune {
+		return description + " and prune"
+	}
+	return description + " without pruning"
+}
+
 // ReadExcludesFile reads one repository-name pattern per line. Blank lines and
 // comments beginning with # after whitespace are ignored.
 func ReadExcludesFile(path string) ([]string, error) {

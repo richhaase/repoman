@@ -136,10 +136,14 @@ stdlib paths. Bump it to a current patch release; do not round it down.
 ### Product behavior and mutation constraints
 
 - The original sync-repos and clean-repos scripts define the default product
-  workflow. Do not silently impose stricter retention rules on the default mode.
+  cleanup workflow. Sync fetch scope and pruning have independent controls;
+  do not silently impose stricter retention rules on default cleanup.
 - Never invoke those scripts or mutate a user's real repositories/config in tests.
   Use t.TempDir Git fixtures and fake GitHub metadata; tests need no network.
-- Sync fetches all remotes with pruning before checkout eligibility decisions.
+- Sync defaults to fetching origin using its configured refspecs, without pruning,
+  before checkout eligibility decisions. Per-target fetch_scope (origin/all) and
+  prune settings can be overridden by --fetch-scope and --prune, including false.
+  Explicit no-prune must override ambient Git prune settings.
   Ordinary ignored files and linked worktrees do not block synchronization.
   Forced checkout/reset is allowed only with explicit --force. Inactive primary
   eviction is allowed only with --cleanup and the original tracked/untracked

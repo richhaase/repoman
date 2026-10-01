@@ -34,6 +34,8 @@ type Target struct {
 	Excludes     []string `json:"excludes,omitempty"`
 	Events       *bool    `json:"events,omitempty"`
 	CleanupLevel string   `json:"cleanup_level,omitempty"`
+	FetchScope   string   `json:"fetch_scope,omitempty"`
+	Prune        bool     `json:"prune,omitempty"`
 }
 
 // Result records either a completed action, a dry-run plan, or a reason for skipping.
@@ -71,14 +73,17 @@ func Run(ctx context.Context, target Target, dryRun bool) ([]Result, error) {
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}$`)
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
-// Options are invocation-only: destructive choices are never saved on a target.
+// Options controls this invocation. Empty FetchScope and nil Prune use the
+// target's settings. Force and Cleanup are never saved on a target.
 type Options struct {
-	DryRun  bool
-	Force   bool
-	Cleanup bool
+	DryRun     bool
+	Force      bool
+	Cleanup    bool
+	FetchScope string
+	Prune      *bool
 }
 
-// RunWithOptions runs sync with explicit force and cleanup choices. DryRun
+// RunWithOptions runs sync with fetch, force, and cleanup choices. DryRun
 // previews all actions without writing the filesystem or Git metadata.
 func RunWithOptions(ctx context.Context, target Target, options Options) ([]Result, error) {
 	return (&engine{command: runCommand, now: time.Now}).runWithOptions(ctx, target, options)
@@ -90,6 +95,9 @@ func (e *engine) run(ctx context.Context, target Target, dryRun bool) ([]Result,
 
 func (e *engine) runWithOptions(ctx context.Context, target Target, options Options) ([]Result, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, _, err := fetchOptions(target, options); err != nil {
 		return nil, err
 	}
 	if target.Owner == "" {
@@ -274,6 +282,10 @@ func (e *engine) syncOne(ctx context.Context, target Target, repo remoteRepo, dr
 
 func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo remoteRepo, options Options) (Result, error) {
 	result := Result{Name: repo.Name, Path: filepath.Join(target.Dir, repo.Name), Action: "skipped"}
+	scope, prune, err := fetchOptions(target, options)
+	if err != nil {
+		return result, err
+	}
 	if err := checkRoot(target.Dir); err != nil {
 		return result, err
 	}
@@ -318,23 +330,25 @@ func (e *engine) syncOneWithOptions(ctx context.Context, target Target, repo rem
 	}
 	if options.DryRun {
 		result.Action = "would-fetch"
-		result.Reason = "would fetch all remotes and prune; " + checkoutReason(state, branch)
+		fetch := "would fetch " + fetchDescription(scope, prune)
+		result.Reason = fetch + "; " + checkoutReason(state, branch)
 		if len(state.Problems) > 0 {
 			return result, fmt.Errorf("inspect checkout: %s", strings.Join(state.Problems, "; "))
 		}
 		if branch != "" && options.Force {
 			result.Action = "would-force"
-			result.Reason = "would fetch all remotes and prune, then force " + branch + " to origin/" + branch + "; local changes and default-branch commits may be discarded"
+			result.Reason = fetch + ", then force " + branch + " to origin/" + branch + "; local changes and default-branch commits may be discarded"
 		} else if checkoutReason(state, branch) == "" {
 			result.Action = "would-sync"
-			result.Reason = "would fetch all remotes and prune, then fast-forward if possible; remote freshness is unknown"
+			result.Reason = fetch + ", then fast-forward if possible; remote freshness is unknown"
 		}
 		return result, nil
 	}
 	// Fetch is independent of checkout eligibility: dirty, detached, non-default,
-	// ahead and diverged clones still refresh every configured remote and prune.
-	if _, err := e.command(ctx, result.Path, "git", "fetch", "--all", "--prune", "--quiet"); err != nil {
-		return result, fmt.Errorf("fetch all remotes failed: %w", err)
+	// ahead and diverged clones still refresh the selected remotes. Explicit
+	// --no-prune overrides both fetch.prune and remote.<name>.prune config.
+	if _, err := e.command(ctx, result.Path, "git", fetchArgs(scope, prune)...); err != nil {
+		return result, fmt.Errorf("fetch %s failed: %w", fetchDescription(scope, prune), err)
 	}
 	result.Action = "fetched"
 	after, reason, err := e.primaryState(ctx, result.Path, repo)

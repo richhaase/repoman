@@ -3,7 +3,9 @@ package syncer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -18,12 +20,15 @@ type gitFixture struct {
 	dest            string
 	initial, remote string
 	fetches         int
+	fetchCommands   [][]string
+	globalConfig    string
 	repos           []remoteRepo
 }
 
 func newGitFixture(t *testing.T) *gitFixture {
 	t.Helper()
 	f := &gitFixture{t: t, root: syncTempDir(t), repos: []remoteRepo{activeRepo("project")}}
+	f.globalConfig = filepath.Join(f.root, "global.gitconfig")
 	f.source, f.bare = filepath.Join(f.root, "source"), filepath.Join(f.root, "remote.git")
 	f.clones = filepath.Join(f.root, "clones")
 	f.dest = filepath.Join(f.clones, "project")
@@ -39,23 +44,40 @@ func newGitFixture(t *testing.T) *gitFixture {
 	f.git(f.root, "clone", "--quiet", f.bare, f.dest)
 	f.git(f.dest, "remote", "set-url", "origin", "https://github.com/alice/project.git")
 	f.git(f.dest, "remote", "add", "secondary", f.bare)
+	f.git(f.dest, "fetch", "--quiet", "secondary")
 	f.initial = f.git(f.dest, "rev-parse", "HEAD")
+	f.git(f.dest, "tag", "local-only")
 	f.write(f.source, "tracked.txt", "remote change\n")
 	f.commit(f.source, "remote change")
 	f.remote = f.git(f.source, "rev-parse", "HEAD")
+	f.git(f.source, "branch", "feature")
 	f.git(f.source, "tag", "remote-tag")
-	f.git(f.source, "push", "--quiet", f.bare, "main", "refs/tags/remote-tag", ":refs/heads/obsolete")
+	f.git(f.source, "push", "--quiet", f.bare, "main", "feature", "refs/tags/remote-tag", ":refs/heads/obsolete")
 	return f
 }
 
 func (f *gitFixture) git(dir string, args ...string) string {
 	f.t.Helper()
-	out, err := runCommand(context.Background(), dir, "git", args...)
+	out, err := f.command(context.Background(), dir, "git", args...)
 	if err != nil {
 		f.t.Fatalf("git %v: %v", args, err)
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func (f *gitFixture) command(ctx context.Context, dir, program string, args ...string) ([]byte, error) {
+	// Use production Git safeguards with an isolated global config. This allows
+	// actual ambient-config tests without reading or writing the user's config.
+	cmd := exec.CommandContext(ctx, program, args...) // #nosec G204 -- fixed Git executable and arguments from temporary test fixtures.
+	cmd.Dir = dir
+	cmd.Env = append(commandEnvironment(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+f.globalConfig)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w: %s", program, err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}
+
 func (f *gitFixture) write(dir, name, contents string) {
 	f.t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
@@ -74,9 +96,7 @@ func (f *gitFixture) engine() *engine {
 		}
 		if len(args) > 0 && args[0] == "fetch" {
 			f.fetches++
-			if !reflect.DeepEqual(args, []string{"fetch", "--all", "--prune", "--quiet"}) {
-				f.t.Fatalf("unexpected fetch: %v", args)
-			}
+			f.fetchCommands = append(f.fetchCommands, append([]string(nil), args...))
 			// The production fetch command runs unchanged; only the test's
 			// origin transport is redirected to a temporary bare repository.
 			args = append([]string{"-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-c", "url." + f.bare + ".insteadOf=https://github.com/alice/project.git"}, args...)
@@ -84,7 +104,7 @@ func (f *gitFixture) engine() *engine {
 		if len(args) > 0 && (args[0] == "reset" || args[0] == "clean" || args[0] == "branch") {
 			f.t.Fatalf("unexpected destructive command: %v", args)
 		}
-		return runCommand(ctx, dir, program, args...)
+		return f.command(ctx, dir, program, args...)
 	}}
 }
 func (f *gitFixture) run(options Options) ([]Result, error) {
@@ -95,17 +115,22 @@ func (f *gitFixture) assertFetched() {
 	if f.fetches != 1 {
 		f.t.Fatalf("fetch count %d", f.fetches)
 	}
-	for _, ref := range []string{"refs/remotes/origin/main", "refs/remotes/secondary/main", "refs/tags/remote-tag"} {
+	if want := []string{"fetch", "--no-all", "--no-prune", "--no-prune-tags", "--quiet", "origin"}; !reflect.DeepEqual(f.fetchCommands[0], want) {
+		f.t.Fatalf("unexpected fetch: %v", f.fetchCommands[0])
+	}
+	for _, ref := range []string{"refs/remotes/origin/main", "refs/remotes/origin/feature", "refs/tags/remote-tag"} {
 		if got := f.git(f.dest, "rev-parse", ref); got != f.remote {
 			f.t.Fatalf("%s=%s want %s", ref, got, f.remote)
 		}
 	}
-	if _, err := runCommand(context.Background(), f.dest, "git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/obsolete"); !commandExitOne(err) {
-		f.t.Fatalf("obsolete branch not pruned: %v", err)
+	for _, ref := range []string{"refs/remotes/origin/obsolete", "refs/remotes/secondary/main", "refs/remotes/secondary/obsolete", "refs/tags/local-only"} {
+		if got := f.git(f.dest, "rev-parse", ref); got != f.initial {
+			f.t.Fatalf("%s changed to %s, want %s", ref, got, f.initial)
+		}
 	}
 }
 
-func TestScriptFetchAndCheckoutParity(t *testing.T) {
+func TestFetchAndCheckoutSafety(t *testing.T) {
 	for _, scenario := range []string{"clean", "dirty", "untracked", "nondefault", "detached", "ahead", "diverged", "ignored", "linked", "no-default", "missing-origin-default"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newGitFixture(t)

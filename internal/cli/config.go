@@ -30,13 +30,14 @@ func newConfigCmd() *cobra.Command {
 }
 
 func newConfigAddCmd(o *configOptions) *cobra.Command {
-	var owner, excludesFile, cleanupLevel string
+	var owner, excludesFile, cleanupLevel, fetchScope string
 	var days int
+	var prune bool
 	var includes, excludes []string
 	cmd := &cobra.Command{
 		Use:   "add DIR",
 		Short: "Register or replace a target, appending it in configuration order",
-		Long:  "Register or replace a target's sync settings. Omitted sync flags use their defaults; an existing cleanup level is retained unless --cleanup-level is supplied. New registrations use push-only activity (events=false).",
+		Long:  "Register or replace a target's sync settings. Omitted owner, days, and filter flags use their defaults. Existing cleanup level, fetch scope, and pruning settings are retained unless their flags are supplied. New registrations use push-only activity (events=false), fetch origin, and do not prune.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := cmd.Context().Err(); err != nil {
@@ -47,6 +48,11 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 			}
 			if cmd.Flags().Changed("cleanup-level") && strings.TrimSpace(cleanupLevel) == "" {
 				return configError(fmt.Errorf("--cleanup-level cannot be empty"))
+			}
+			if cmd.Flags().Changed("fetch-scope") {
+				if err := validateFetchScopeFlag(fetchScope); err != nil {
+					return configError(err)
+				}
 			}
 			dir, err := config.Normalize(args[0])
 			if err != nil {
@@ -73,8 +79,12 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 			if err = cmd.Context().Err(); err != nil {
 				return err
 			}
-			target := syncer.Target{Dir: dir, Owner: owner, Days: days, Includes: includes, Excludes: patterns, CleanupLevel: cleanupLevel}
-			updated, err := config.Register(o.path, target)
+			target := syncer.Target{Dir: dir, Owner: owner, Days: days, Includes: includes, Excludes: patterns, CleanupLevel: cleanupLevel, FetchScope: fetchScope}
+			registration := config.RegisterOptions{}
+			if cmd.Flags().Changed("prune") {
+				registration.Prune = &prune
+			}
+			updated, err := config.RegisterWithOptions(o.path, target, registration)
 			if err != nil {
 				return configError(err)
 			}
@@ -92,6 +102,8 @@ func newConfigAddCmd(o *configOptions) *cobra.Command {
 	cmd.Flags().StringArrayVarP(&excludes, "exclude", "e", nil, "repository-name glob to exclude (repeatable; wins over includes)")
 	cmd.Flags().StringVar(&excludesFile, "excludes-file", "", "file of exclude patterns, one per line; blank and # comment lines ignored")
 	cmd.Flags().StringVar(&cleanupLevel, "cleanup-level", "", "cleanup level: conservative, balanced, or aggressive (retains existing value if omitted)")
+	cmd.Flags().StringVar(&fetchScope, "fetch-scope", "", "fetch scope: origin (default) or all; retains existing value if omitted")
+	cmd.Flags().BoolVar(&prune, "prune", false, "prune stale remote-tracking refs when fetching; retains existing value if omitted (use --prune=false to disable)")
 	cmd.Flags().Bool("no-events", false, "use push-only activity (already the default for registrations)")
 	return cmd
 }
@@ -181,5 +193,7 @@ func printConfigTarget(cmd *cobra.Command, target syncer.Target) {
 	if target.CleanupLevel != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "   cleanup_level: %s", target.CleanupLevel)
 	}
+	fetchScope, _ := syncer.ParseFetchScope(target.FetchScope) // Config reads and writes validate the scope.
+	fmt.Fprintf(cmd.OutOrStdout(), "   fetch_scope: %s   prune: %t", fetchScope, target.Prune)
 	fmt.Fprintln(cmd.OutOrStdout())
 }
