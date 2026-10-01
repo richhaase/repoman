@@ -28,7 +28,7 @@ func TestProgressPreservesPreviewResults(t *testing.T) {
 }
 
 func TestProgressRechecksDestinationBeforeClone(t *testing.T) {
-	root := t.TempDir()
+	root := syncTempDir(t)
 	repo := activeRepo("project")
 	target := Target{Dir: root, Owner: "alice", Days: 45}
 	called := false
