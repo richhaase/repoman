@@ -27,7 +27,7 @@ func levelConfig(t *testing.T, levels ...string) string {
 }
 func TestCleanupPolicyPrecedence(t *testing.T) {
 	for _, tt := range []struct{ name, configured, override, want string }{
-		{"default", "", "", "conservative"},
+		{"default", "", "", "aggressive"},
 		{"configured balanced", "balanced", "", "balanced"},
 		{"configured aggressive", "aggressive", "", "aggressive"},
 		{"override less aggressive", "aggressive", "conservative", "conservative"},
@@ -46,7 +46,7 @@ func TestCleanupPolicyPrecedence(t *testing.T) {
 			if err := json.Unmarshal([]byte(out), &report); err != nil {
 				t.Fatal(err)
 			}
-			if len(report.CleanupPolicies) != 1 || string(report.CleanupPolicies[0].Level) != tt.want || !report.DryRun || report.CleanupPolicies[0].DiscardLocalChanges {
+			if len(report.CleanupPolicies) != 1 || string(report.CleanupPolicies[0].Level) != tt.want || report.DryRun || report.CleanupPolicies[0].DiscardLocalChanges {
 				t.Fatalf("report=%s", out)
 			}
 			if report.SchemaVersion != 1 {
@@ -73,33 +73,39 @@ func TestCleanupMixedPolicies(t *testing.T) {
 		}
 	}
 }
-func TestAggressiveApplyRequiresInvocationAcknowledgement(t *testing.T) {
-	config := levelConfig(t, "aggressive")
-	_, _, err := executeCommand(t, t.Context(), "clean", "--config", config, "--apply")
-	var coded *ExitError
-	if !errors.As(err, &coded) || coded.Code != 2 || !strings.Contains(err.Error(), "--discard-local-changes") {
-		t.Fatalf("error=%v", err)
-	}
-	out, _, err := executeCommand(t, t.Context(), "clean", "--config", config, "--apply", "--discard-local-changes", "--json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var report envelope
-	if err := json.Unmarshal([]byte(out), &report); err != nil {
-		t.Fatal(err)
-	}
-	if report.DryRun || !report.CleanupPolicies[0].DiscardLocalChanges {
-		t.Fatal(out)
-	}
-	// An override to conservative restores the non-destructive default behavior.
-	_, _, err = executeCommand(t, t.Context(), "clean", "--config", config, "--level", "conservative", "--apply")
-	if err != nil {
-		t.Fatal(err)
+func TestCleanApplyAndPreviewFlags(t *testing.T) {
+	for _, test := range []struct {
+		flags []string
+		dry   bool
+		bad   bool
+	}{
+		{flags: nil}, {flags: []string{"--apply"}}, {flags: []string{"--apply=true"}},
+		{flags: []string{"--dry-run"}, dry: true}, {flags: []string{"-n"}, dry: true},
+		{flags: []string{"--apply=false"}, dry: true}, {flags: []string{"--dry-run=false"}},
+		{flags: []string{"--apply=false", "--dry-run=true"}, dry: true},
+		{flags: []string{"--apply=true", "--dry-run=true"}, bad: true},
+		{flags: []string{"--discard-local-changes"}}, {flags: []string{"--discard-local-changes=false"}},
+	} {
+		args := append([]string{"clean", "--root", t.TempDir(), "--json"}, test.flags...)
+		out, _, err := executeCommand(t, t.Context(), args...)
+		if (err != nil) != test.bad {
+			t.Fatalf("flags=%v err=%v", test.flags, err)
+		}
+		if test.bad {
+			continue
+		}
+		var report envelope
+		if err := json.Unmarshal([]byte(out), &report); err != nil {
+			t.Fatal(err)
+		}
+		if report.DryRun != test.dry || report.CleanupPolicies[0].Level != "aggressive" {
+			t.Fatalf("flags=%v report=%s", test.flags, out)
+		}
 	}
 }
 func TestInvalidCleanupOptionsBeforeInspection(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
-	for _, flags := range [][]string{{"--level", "reckless"}, {"--level", ""}, {"--level", " "}, {"--level", "balanced", "--discard-local-changes"}, {"--level", "aggressive", "--apply"}, {"--discard-local-changes"}} {
+	for _, flags := range [][]string{{"--level", "reckless"}, {"--level", ""}, {"--level", " "}, {"--level", "balanced", "--discard-local-changes"}, {"--apply", "--dry-run"}, {"--days", "0"}, {"-d", "-1"}} {
 		args := append([]string{"clean", "--root", missing}, flags...)
 		_, _, err := executeCommand(t, t.Context(), args...)
 		var coded *ExitError
@@ -116,7 +122,7 @@ func TestCleanupHumanPolicyAndWarningEvenWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"level=aggressive", "Preview only", "tracked changes, untracked files, and ignored files", "--discard-local-changes"} {
+	for _, want := range []string{"cleanup apply", "level=aggressive", "including local changes", "branch refs are retained"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q from %s", want, out)
 		}
@@ -124,12 +130,12 @@ func TestCleanupHumanPolicyAndWarningEvenWhenEmpty(t *testing.T) {
 }
 func TestCleanupLevelFlagsDoNotLeak(t *testing.T) {
 	root := t.TempDir()
-	_, _, err := executeCommand(t, t.Context(), "clean", "--root", root, "--level", "aggressive", "--discard-local-changes")
+	_, _, err := executeCommand(t, t.Context(), "clean", "--root", root, "--level", "conservative", "--dry-run")
 	if err != nil {
 		t.Fatal(err)
 	}
 	out, _, err := executeCommand(t, t.Context(), "clean", "--root", root)
-	if err != nil || !strings.Contains(out, "level=conservative") || strings.Contains(out, "WARNING") {
+	if err != nil || !strings.Contains(out, "level=aggressive") || !strings.Contains(out, "cleanup apply") {
 		t.Fatalf("out=%s err=%v", out, err)
 	}
 }

@@ -4,7 +4,7 @@ This file provides guidance for AI assistants working with this codebase.
 
 ## Project Overview
 
-repoman is a conservative Go CLI for local clone/worktree inventory, safe GitHub synchronization, and plan-first cleanup. It was bootstrapped from richhaase/go-cli-template and follows its Cobra constructor and build conventions.
+repoman combines sync-repos and clean-repos workflows in a Go CLI: clone/worktree inventory, GitHub synchronization, and configurable cleanup. It was bootstrapped from richhaase/go-cli-template and follows its Cobra constructor and build conventions.
 
 ## Build & Test Commands
 
@@ -34,9 +34,9 @@ make clean             # Clean build artifacts
 │   │   └── *.go        # Additional commands
 │   ├── repository/     # Read-only Git/process inventory
 │   ├── syncer/         # GitHub activity selection and safe clone/FF
-│   ├── cleanup/        # Conservative cleanup proof and revalidation
+│   ├── cleanup/        # Configurable worktree cleanup and revalidation
 │   ├── domain/         # Reserved core domain package
-│   ├── config/         # Configuration loading
+│   ├── config/         # Configuration loading and target management
 │   └── terminal/       # TTY detection helpers
 └── .github/workflows/  # CI and release automation
 ```
@@ -133,20 +133,41 @@ stdlib paths. Bump it to a current patch release; do not round it down.
 
 ## Common Tasks
 
-### Safety constraints
+### Product behavior and mutation constraints
 
-- Never invoke the original sync-repos/clean-repos scripts or mutate a user's real data in tests.
-- Tests use t.TempDir Git fixtures and fake GitHub metadata; no network is needed.
-- Keep unknown state distinct from clean. Cleanup must protect hidden index flags,
-  local-only committed work, locks, in-use paths, and primary clones at every level.
-  Conservative/balanced also protect all dirty, ignored, and untracked files;
-  aggressive may discard them only under the explicit gated exception below.
-- Keep cleanup default preview; apply revalidates identity, local state, and PR proof.
-- Never add forced checkout, reset, or primary clone deletion. Aggressive worktree
-  removal is allowed only behind invocation-level discard acknowledgement, complete
-  policy proof, nested-repository protections, and bounded content revalidation.
-  Never persist discard authorization in config or run destructive user-data tests.
-- Process observation explicitly covers the current OS user, not the whole system.
+- The original sync-repos and clean-repos scripts define the default product
+  cleanup workflow. Sync fetch scope and pruning have independent controls;
+  do not silently impose stricter retention rules on default cleanup.
+- Never invoke those scripts or mutate a user's real repositories/config in tests.
+  Use t.TempDir Git fixtures and fake GitHub metadata; tests need no network.
+- Sync defaults to fetching origin using its configured refspecs, without pruning,
+  before checkout eligibility decisions. Per-target fetch_scope (origin/all) and
+  prune settings can be overridden by --fetch-scope and --prune, including false.
+  Explicit no-prune must override ambient Git prune settings.
+  Ordinary ignored files and linked worktrees do not block synchronization.
+  Forced checkout/reset is allowed only with explicit --force. Inactive primary
+  eviction is allowed only with --cleanup and the original tracked/untracked
+  status guard; a primary with linked worktrees is retained to protect their
+  shared metadata. --force does not override this eviction guard.
+- Clean applies by default; --dry-run previews. Default aggressive matches the
+  original worktree policy: retain primary, locked, own-user cwd, and open-PR
+  worktrees. Local changes or unpublished commits are not default retention gates.
+  Conservative and balanced are optional stricter policies.
+- Cleanup follows exact worktree registrations, including paths outside the
+  selected parent. Preserve branch refs. Never double-force an explicit lock or
+  replace Git worktree removal with a shell delete fallback.
+- Identity and PR lookup errors are distinct from no evidence of in-flight work.
+  Default aggressive process observation is best effort, with visible stderr/JSON
+  warnings for incomplete visibility and every observed cwd match protected.
+  Strict levels fail closed on incomplete process observation. Preflight all
+  selected targets before mutations, recheck candidates, and report partial
+  failure honestly.
+- Process observation for default cleanup covers the current OS user's cwd, not
+  every open file or shared Git directory. A used primary does not protect an
+  unrelated linked worktree.
+- Config management writes only the selected config and preserves symlinks,
+  unrelated entries, permissions, and atomic replacement semantics. Sync, status,
+  and clean do not rewrite config.
 - JSON schema version 1 and human rendering share engine results. Stdout is data;
   diagnostics go to stderr. Preserve cancellation and partial failure exit codes.
 

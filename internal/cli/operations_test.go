@@ -181,15 +181,14 @@ func TestVersionAndHelp(t *testing.T) {
 		}
 	}
 }
-func TestCleanMultipleApplyRefused(t *testing.T) {
+func TestCleanMultipleApplySupported(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "config.json")
 	data, _ := json.Marshal(map[string]any{"targets": []any{map[string]any{"dir": t.TempDir()}, map[string]any{"dir": t.TempDir()}}})
 	if e := os.WriteFile(p, data, 0600); e != nil {
 		t.Fatal(e)
 	}
 	_, _, e := executeCommand(t, t.Context(), "clean", "--config", p, "--apply")
-	var coded *ExitError
-	if !errors.As(e, &coded) || coded.Code != 2 {
+	if e != nil {
 		t.Fatalf("error=%v", e)
 	}
 }
