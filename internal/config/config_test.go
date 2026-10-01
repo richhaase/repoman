@@ -18,6 +18,9 @@ func TestLoad(t *testing.T) {
 		{"trailing", `{"targets":[]} {}`, true},
 		{"duplicate", `{"targets":[{"dir":"/tmp/a"},{"dir":"/tmp/a/../a"}]}`, true},
 		{"negative", `{"targets":[{"dir":"/tmp","days":-1}]}`, true},
+		{"cleanup level", `{"targets":[{"dir":"/tmp","cleanup_level":"aggressive"}]}`, false},
+		{"invalid cleanup level", `{"targets":[{"dir":"/tmp","cleanup_level":"reckless"}]}`, true},
+		{"cannot persist discard", `{"targets":[{"dir":"/tmp","cleanup_level":"aggressive","discard_local_changes":true}]}`, true},
 		{"pattern", `{"targets":[{"dir":"/tmp","includes":["["]}]}`, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

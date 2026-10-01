@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/richhaase/repoman/internal/cleanup"
 	"github.com/richhaase/repoman/internal/syncer"
 )
 
@@ -63,6 +64,9 @@ func Load(path string) (Config, error) {
 	seen := map[string]bool{}
 	for i := range c.Targets {
 		t := &c.Targets[i]
+		if _, levelErr := cleanup.ParseLevel(t.CleanupLevel); levelErr != nil {
+			return c, fmt.Errorf("target %q cleanup_level: %w", t.Dir, levelErr)
+		}
 		t.Dir, err = Normalize(t.Dir)
 		if err != nil {
 			return c, err

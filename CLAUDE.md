@@ -138,9 +138,14 @@ stdlib paths. Bump it to a current patch release; do not round it down.
 - Never invoke the original sync-repos/clean-repos scripts or mutate a user's real data in tests.
 - Tests use t.TempDir Git fixtures and fake GitHub metadata; no network is needed.
 - Keep unknown state distinct from clean. Cleanup must protect hidden index flags,
-  local-only work, ignored/untracked files, locks, in-use paths, and primary clones.
+  local-only committed work, locks, in-use paths, and primary clones at every level.
+  Conservative/balanced also protect all dirty, ignored, and untracked files;
+  aggressive may discard them only under the explicit gated exception below.
 - Keep cleanup default preview; apply revalidates identity, local state, and PR proof.
-- Do not add forced checkout, reset, worktree removal, or primary clone deletion.
+- Never add forced checkout, reset, or primary clone deletion. Aggressive worktree
+  removal is allowed only behind invocation-level discard acknowledgement, complete
+  policy proof, nested-repository protections, and bounded content revalidation.
+  Never persist discard authorization in config or run destructive user-data tests.
 - Process observation explicitly covers the current OS user, not the whole system.
 - JSON schema version 1 and human rendering share engine results. Stdout is data;
   diagnostics go to stderr. Preserve cancellation and partial failure exit codes.
