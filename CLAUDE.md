@@ -74,6 +74,13 @@ previous run's value.
 
 ### Output
 
+- `internal/cli/human.go` owns human rendering. Operation JSON remains schema 1,
+  and config JSON remains the plain configuration. Human progress uses optional
+  context observers in `internal/progress`; final results determine totals.
+- Emit warnings and blocking progress before final mutation checks. Any warning
+  discovered during revalidation must be followed by fresh inspection after it
+  is written: terminal/pipe writes can block. Never print an intended action as
+  already completed. Sanitize terminal controls in human text, not machine data.
 - Write command output with `fmt.Fprintf(cmd.OutOrStdout(), ...)` rather than
   `fmt.Printf` so tests can capture it
 

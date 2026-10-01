@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/richhaase/repoman/internal/progress"
 	"github.com/richhaase/repoman/internal/repository"
 )
 
@@ -89,6 +90,7 @@ func lookupEvidenceForLevel(ctx context.Context, state repository.State, read ap
 		// branch has advanced beyond the locally checked-out commit.
 		if pr.State == "open" {
 			openReason = "current commit is associated with an open PR"
+			progress.Report(ctx, progress.Event{Phase: "open-pr", Path: state.Path, Detail: fmt.Sprintf("PR #%d open", pr.Number)})
 		}
 	}
 	if state.Branch != "" {
@@ -109,6 +111,7 @@ func lookupEvidenceForLevel(ctx context.Context, state repository.State, read ap
 			}
 			if pr.Head.Ref == state.Branch && openReason == "" {
 				openReason = "current branch has an open PR"
+				progress.Report(ctx, progress.Event{Phase: "open-pr", Path: state.Path, Detail: fmt.Sprintf("PR #%d open", pr.Number)})
 			}
 		}
 	}
@@ -127,6 +130,7 @@ func lookupEvidenceForLevel(ctx context.Context, state repository.State, read ap
 		}
 		if prs[0].State == "open" && openReason == "" {
 			openReason = fmt.Sprintf("associated PR #%d is open", number)
+			progress.Report(ctx, progress.Event{Phase: "open-pr", Path: state.Path, Detail: fmt.Sprintf("PR #%d open", number)})
 		}
 	}
 	if openReason != "" {

@@ -38,7 +38,7 @@ func TestConfigCommandLifecycleAndPrecedence(t *testing.T) {
 		t.Fatalf("explicit --config did not override environment: %v", err)
 	}
 	out, diag, err = executeCommand(t, t.Context(), "config", "list", "--config", explicitPath)
-	if err != nil || diag != "" || !strings.Contains(out, dir) || !strings.Contains(out, "owner: me   days: 17   events: false") || !strings.Contains(out, "cleanup_level: balanced") {
+	if err != nil || diag != "" || !strings.Contains(out, dir) || (!strings.Contains(out, "owner:    me") || !strings.Contains(out, "window:   17 days · push activity")) || !strings.Contains(out, "clean:    balanced") {
 		t.Fatalf("list=%q,%q,%v", out, diag, err)
 	}
 	out, _, err = executeCommand(t, t.Context(), "config", "add", dir, "--config", explicitPath, "--owner", "other", "--json")
@@ -113,11 +113,11 @@ func TestConfigFetchControlsRoundTripAndPreservation(t *testing.T) {
 			if scope == "" {
 				scope = "origin"
 			}
-			prune := "false"
+			prune := "off"
 			if step.prune {
-				prune = "true"
+				prune = "on"
 			}
-			if err != nil || !strings.Contains(human, "fetch_scope: "+scope+"   prune: "+prune) {
+			if err != nil || !strings.Contains(human, "fetch:    "+scope+" · prune "+prune) {
 				t.Fatalf("human list=%s,%v", human, err)
 			}
 		})

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/richhaase/repoman/internal/progress"
 )
 
 // cleanupOne follows the original inactive-clone dirty/untracked guard. Ignored
@@ -14,6 +16,7 @@ import (
 // supplies linked worktrees is protected because removing it breaks them too.
 func (e *engine) cleanupOne(ctx context.Context, target Target, repo remoteRepo, dryRun bool) (Result, error) {
 	result := Result{Name: repo.Name, Path: filepath.Join(target.Dir, repo.Name), Action: "skipped", Reason: "inactive"}
+	progress.Report(ctx, progress.Event{Phase: "inactive", Path: result.Path, Detail: "checking inactive clone"})
 	if err := checkRoot(target.Dir); err != nil {
 		return result, err
 	}

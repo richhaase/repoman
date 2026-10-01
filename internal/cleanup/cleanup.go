@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/richhaase/repoman/internal/progress"
 	"github.com/richhaase/repoman/internal/repopattern"
 	"github.com/richhaase/repoman/internal/repository"
 )
@@ -212,6 +213,7 @@ func runEngines(ctx context.Context, engines []engine, roots []string, apply boo
 			return collect("cleanup blocked during revalidation"), err
 		}
 	}
+	progress.Report(ctx, progress.Event{Phase: "clean-plan", Value: collect("")})
 	for _, p := range plans {
 		if err := p.apply(ctx); err != nil {
 			return collect("cleanup stopped before remaining actions"), err
@@ -235,6 +237,7 @@ func (e engine) plan(ctx context.Context, root string, apply bool) (*cleanupPlan
 	if err != nil {
 		return nil, fmt.Errorf("inspect cleanup root: %w", err)
 	}
+	progress.Report(ctx, progress.Event{Phase: "inventory", Path: root, Detail: "checking registered worktrees"})
 	states, err := e.discover(ctx, identity.resolved)
 	if err != nil {
 		return nil, fmt.Errorf("discover cleanup inventory: %w", err)
@@ -249,6 +252,9 @@ func (e engine) plan(ctx context.Context, root string, apply bool) (*cleanupPlan
 		r.Reason = selectionProtection(p.states, s, e.includes, e.excludes)
 		if r.Reason == "" {
 			recordObservationWarning(&r, s, options.Level)
+			for _, warning := range r.Warnings {
+				progress.Report(ctx, progress.Event{Phase: "warning", Detail: warning})
+			}
 			if issue := inspectionFailure(s, options.Level); issue != "" {
 				r.Reason = issue
 				failures = append(failures, fmt.Errorf("inspect %q: %s", s.Path, issue))
@@ -277,6 +283,7 @@ func (e engine) plan(ctx context.Context, root string, apply bool) (*cleanupPlan
 			p.results = append(p.results, r)
 			continue
 		}
+		progress.Report(ctx, progress.Event{Phase: "pr-check", Path: s.Path, Detail: "checking GitHub PRs"})
 		proof, lookupErr := e.lookup(ctx, s)
 		if lookupErr != nil {
 			r.Reason = "GitHub PR lookup failed; cleanup blocked"
@@ -363,6 +370,17 @@ func (p *cleanupPlan) preflight(ctx context.Context) error {
 	}
 	fresh = normalizeStates(fresh)
 	p.recordObservationWarnings(fresh)
+	for _, warning := range p.warnings {
+		progress.Report(ctx, progress.Event{Phase: "warning", Detail: warning})
+	}
+	if len(p.warnings) > 0 && progress.HasReporter(ctx) {
+		fresh, err = p.engine.discover(ctx, p.root.resolved)
+		if err != nil {
+			return fmt.Errorf("recheck inventory after reporting warnings: %w", err)
+		}
+		fresh = normalizeStates(fresh)
+		p.recordObservationWarnings(fresh)
+	}
 	if !sameInventory(p.states, fresh, p.engine.options.Level) {
 		return errors.New("cleanup inventory changed during planning; no worktrees removed")
 	}
@@ -427,6 +445,9 @@ func (p *cleanupPlan) apply(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if r.Action == ActionWouldRemove {
+			progress.Report(ctx, progress.Event{Phase: "remove", Path: r.Path, Detail: "checking removal"})
+		}
 		if err := p.root.validate(); err != nil {
 			return err
 		}
@@ -441,6 +462,13 @@ func (p *cleanupPlan) apply(ctx context.Context) error {
 		}
 		fresh := normalizeState(p.engine.inspect(ctx, r.Path))
 		recordObservationWarning(r, fresh, p.engine.options.Level)
+		for _, warning := range r.Warnings {
+			progress.Report(ctx, progress.Event{Phase: "warning", Detail: warning})
+		}
+		if len(r.Warnings) > 0 && progress.HasReporter(ctx) {
+			fresh = normalizeState(p.engine.inspect(ctx, r.Path))
+			recordObservationWarning(r, fresh, p.engine.options.Level)
+		}
 		// A newly observed cwd protects this candidate, while unrelated candidates
 		// can proceed. Any simultaneous identity/lock/registration change still fails.
 		if p.engine.options.Level == Aggressive && fresh.CwdInUse && sameInventory([]repository.State{r.State}, []repository.State{fresh}, Aggressive) && inspectionFailure(fresh, Aggressive) == "" {
@@ -460,6 +488,12 @@ func (p *cleanupPlan) apply(ctx context.Context) error {
 			return err
 		}
 		r.State = fresh
+		if err := p.root.validate(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := p.engine.remove(ctx, fresh); err != nil {
 			r.Action = ActionFailed
 			r.Reason = "git removal failed; inspect worktree before retrying"
@@ -471,16 +505,29 @@ func (p *cleanupPlan) apply(ctx context.Context) error {
 		} else {
 			r.Reason = "removed clean linked worktree after verified policy checks; branch refs retained"
 		}
+		progress.Report(ctx, progress.Event{Phase: "clean-result", Value: *r})
 	}
 	return nil
 }
 
 func (p *cleanupPlan) applyPrune(ctx context.Context, common string) error {
+	progress.Report(ctx, progress.Event{Phase: "prune", Path: common, Detail: "checking metadata pruning"})
 	fresh, err := p.engine.discover(ctx, p.root.resolved)
 	if err != nil {
 		return fmt.Errorf("revalidate stale metadata: %w", err)
 	}
 	p.recordObservationWarnings(fresh)
+	for _, warning := range p.warnings {
+		progress.Report(ctx, progress.Event{Phase: "warning", Detail: warning})
+	}
+	if len(p.warnings) > 0 && progress.HasReporter(ctx) {
+		fresh, err = p.engine.discover(ctx, p.root.resolved)
+		if err != nil {
+			return fmt.Errorf("recheck inventory after reporting warnings: %w", err)
+		}
+		fresh = normalizeStates(fresh)
+		p.recordObservationWarnings(fresh)
+	}
 	current := map[string]repository.State{}
 	for _, s := range fresh {
 		current[s.Path] = normalizeState(s)
@@ -510,6 +557,12 @@ func (p *cleanupPlan) applyPrune(ctx context.Context, common string) error {
 		}
 		candidate = s
 	}
+	if err := p.root.validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if p.engine.prune == nil {
 		return errors.New("metadata pruning is unavailable")
 	}
@@ -528,6 +581,17 @@ func (p *cleanupPlan) applyPrune(ctx context.Context, common string) error {
 		return errors.Join(pruneErr, fmt.Errorf("verify metadata pruning: %w", err))
 	}
 	p.recordObservationWarnings(fresh)
+	for _, warning := range p.warnings {
+		progress.Report(ctx, progress.Event{Phase: "warning", Detail: warning})
+	}
+	if len(p.warnings) > 0 && progress.HasReporter(ctx) {
+		fresh, err = p.engine.discover(ctx, p.root.resolved)
+		if err != nil {
+			return fmt.Errorf("recheck inventory after reporting warnings: %w", err)
+		}
+		fresh = normalizeStates(fresh)
+		p.recordObservationWarnings(fresh)
+	}
 	remaining := map[string]bool{}
 	for _, s := range fresh {
 		remaining[s.Path] = true

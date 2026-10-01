@@ -54,6 +54,66 @@ to inspect the plan first, or select a stricter policy below.
 No command prompts for input. Command data goes to stdout, diagnostics to stderr.
 Use `--json` for automation; do not parse the human display.
 
+## Read the output
+
+Human output follows the original scripts: a readable target/settings header,
+plain progress lines while work runs, short results, and a final summary. The
+same non-animated, color-free text works in a terminal or a pipe.
+
+```text
+=== /home/me/src ===
+Sync · apply · configured target
+owner:    me
+window:   45 days · push activity
+fetch:    origin · prune off
+force:    off
+cleanup:  off (inactive clones)
+include:  all
+exclude:  none
+
+  · Listing GitHub repositories for me
+  · app (syncing)
+  ↓ app (fast-forwarded main)
+  · tools (syncing)
+  ✓ tools (up to date)
+  · experiment (syncing)
+  ~ experiment (on feature, not main; fetched only)
+
+=== summary ===
+fast-forwarded:      1
+up to date:          1
+fetched only:        1
+inactive:            8
+Done
+```
+
+- `+` cloned, `↓` updated/reset, `✓` up to date, `~` fetched-only or kept/skipped,
+  `-` removed/planned removal, and `x` failed. The words explain each symbol
+- Inactive, excluded, not-included, and archived repositories are counted in the
+  sync summary. `--verbose` also lists their names and adds inspection/debug detail
+- `status` and `clean` group checkouts by repository and show branch names. Paths
+  inside the selected target are relative to that named repository; registered
+  worktrees outside its target keep their full paths
+- Cleanup prints its effective level and destructive warning before scanning.
+  An apply run shows its checked plan before removal and confirms actual removals
+  as they finish. A plan is not counted as a completed removal
+- Previews say **would** and never claim a clone/update/removal was performed.
+  Sync previews do not fetch, so a possible fast-forward is not a promise that
+  the remote is already up to date
+- Errors are explained once on stderr, with a failed/interrupted summary and a
+  nonzero exit status. Partial work remains visible. Process-visibility warnings
+  are kept distinct from errors and shown before cleanup mutations
+- `config` output shows one saved target at a time, with the effective fetch,
+  pruning, activity, selection, and worktree-cleanup settings. Changing the
+  presentation does not change the registration/update rules below
+
+`--json` has no human headers, progress, or summaries on stdout. The existing
+schema-version-1 operation envelopes, action/reason fields, and exit codes are
+unchanged; `config --json` still emits the plain configuration object. Warnings
+remain available on stderr and in operation JSON. Use this mode for scripts,
+not the human display. Terminal controls in paths and diagnostics
+are escaped in human output; JSON retains the original data.
+
 ## Tune each operation independently
 
 Fetching, checkout updates, and deletion have separate controls. Raising a

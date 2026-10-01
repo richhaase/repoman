@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -26,8 +27,17 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 
 	root := &cobra.Command{
 		Use:   "repoman",
-		Short: "Manage local clones and worktrees safely",
-		Long:  `Manage configured targets, inventory clones, sync active GitHub repositories, and clean worktrees under configurable policies.`,
+		Short: "Keep your repositories up to date and tidy",
+		Long: `Keep your repositories up to date and tidy.
+
+  status   See local clones, branches, and worktrees
+  sync     Clone and update active GitHub repositories
+  clean    Remove eligible linked worktrees
+  config   Choose the folders and GitHub owners to manage
+
+Start with sync --dry-run or clean --dry-run to preview changes.
+Clean applies by default; its aggressive policy can discard local files.`,
+		Example: "  repoman config add ~/src\n  repoman status\n  repoman sync --dry-run\n  repoman clean --dry-run",
 
 		Version:       build.Version,
 		SilenceErrors: true,
@@ -43,7 +53,7 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose (debug) logging")
+	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "show routine skips and extra repository details (plus debug logs)")
 
 	root.AddCommand(
 		newConfigCmd(),
@@ -60,16 +70,22 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 func Execute(ctx context.Context, version, commit, date string) int {
 	root := NewRootCmd(BuildInfo{Version: version, Commit: commit, Date: date})
 
-	if err := root.ExecuteContext(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		if errors.Is(err, context.Canceled) {
-			return 130
-		}
-		var coded *ExitError
-		if errors.As(err, &coded) {
-			return coded.Code
-		}
-		return 1
+	return reportExecution(root.ExecuteContext(ctx), os.Stderr)
+}
+
+func reportExecution(err error, stderr io.Writer) int {
+	if err == nil {
+		return 0
 	}
-	return 0
+	var reported *ExitError
+	if !errors.As(err, &reported) || !reported.Reported {
+		fmt.Fprintf(stderr, "Error: %s\n", humanText(err.Error()))
+	}
+	if errors.Is(err, context.Canceled) {
+		return 130
+	}
+	if errors.As(err, &reported) {
+		return reported.Code
+	}
+	return 1
 }
