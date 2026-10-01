@@ -1,7 +1,7 @@
 .PHONY: help build install run test test-coverage fmt fmt-check vet lint vuln check release-snapshot clean deps deps-list deps-update generate
 
-BINARY := mycli
-CMD_PATH := ./cmd/mycli
+BINARY := repoman
+CMD_PATH := ./cmd/repoman
 BIN_DIR := bin
 
 GOLANGCI_LINT_VERSION := v2.12.2
@@ -10,7 +10,7 @@ help:
 	@echo "Available targets:"
 	@echo "  build            - Build the $(BINARY) binary with version information"
 	@echo "  install          - Install to GOBIN with version information"
-	@echo "  run              - Build and run (make run ARGS=\"example --name Dev\")"
+	@echo "  run              - Build and run (make run ARGS=\"status --root ~/src\")"
 	@echo "  test             - Run all tests with -race"
 	@echo "  test-coverage    - Run tests with coverage report"
 	@echo "  fmt              - Format code (rewrites files)"
@@ -58,7 +58,7 @@ test-coverage:
 
 fmt:
 	@go fmt ./...
-	@go tool goimports -w .
+	@go tool goimports -local github.com/richhaase/repoman -w .
 	@echo "Formatted all Go files"
 
 fmt-check:

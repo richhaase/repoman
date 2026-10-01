@@ -13,7 +13,7 @@ func newVersionCmd(build BuildInfo) *cobra.Command {
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "mycli %s\n", build.Version)
+			fmt.Fprintf(out, "repoman %s\n", build.Version)
 			fmt.Fprintf(out, "  commit: %s\n", build.Commit)
 			fmt.Fprintf(out, "  built:  %s\n", build.Date)
 		},

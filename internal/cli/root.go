@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -24,10 +25,9 @@ func NewRootCmd(build BuildInfo) *cobra.Command {
 	var verbose bool
 
 	root := &cobra.Command{
-		Use:   "mycli",
-		Short: "A brief description of your CLI",
-		Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application.`,
+		Use:   "repoman",
+		Short: "Manage local clones and worktrees safely",
+		Long:  `Inventory clones, safely sync active GitHub repositories, and preview conservative worktree cleanup.`,
 
 		Version:       build.Version,
 		SilenceErrors: true,
@@ -46,7 +46,9 @@ examples and usage of using your application.`,
 	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose (debug) logging")
 
 	root.AddCommand(
-		newExampleCmd(),
+		newStatusCmd(),
+		newSyncCmd(),
+		newCleanCmd(),
 		newVersionCmd(build),
 	)
 
@@ -59,6 +61,13 @@ func Execute(ctx context.Context, version, commit, date string) int {
 
 	if err := root.ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if errors.Is(err, context.Canceled) {
+			return 130
+		}
+		var coded *ExitError
+		if errors.As(err, &coded) {
+			return coded.Code
+		}
 		return 1
 	}
 	return 0

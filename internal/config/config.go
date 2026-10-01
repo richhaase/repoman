@@ -1,59 +1,90 @@
-// Package config loads application configuration.
+// Package config loads repoman's JSON target configuration without modifying it.
 package config
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/richhaase/repoman/internal/syncer"
 )
 
-// Config holds the application configuration.
 type Config struct {
-	Debug bool `yaml:"debug"`
+	Targets []syncer.Target `json:"targets"`
 }
 
-// DefaultConfig returns the default configuration.
-func DefaultConfig() *Config {
-	return &Config{
-		Debug: false,
+func DefaultPath() string {
+	if p := os.Getenv("REPOMAN_CONFIG"); p != "" {
+		return p
 	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "repoman", "config.json")
 }
 
-// Load reads configuration: flags override env, which overrides file, which overrides defaults.
-func Load() (*Config, error) {
-	cfg := DefaultConfig()
-
-	if configPath := findConfigFile(); configPath != "" {
-		_ = configPath
+func Normalize(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
 	}
-
-	if os.Getenv("MYCLI_DEBUG") == "true" {
-		cfg.Debug = true
+	if path == "" {
+		return "", fmt.Errorf("empty target directory")
 	}
-
-	return cfg, nil
+	return filepath.Abs(filepath.Clean(path))
 }
 
-func findConfigFile() string {
-	if _, err := os.Stat(".mycli.yaml"); err == nil {
-		return ".mycli.yaml"
+func Load(path string) (Config, error) {
+	var c Config
+	f, err := os.Open(path)
+	if err != nil {
+		return c, fmt.Errorf("read config %q: %w", path, err)
 	}
-
-	if dir := configDir(); dir != "" {
-		configPath := filepath.Join(dir, "mycli", "config.yaml")
-		if _, err := os.Stat(configPath); err == nil {
-			return configPath
+	defer func() { _ = f.Close() }()
+	d := json.NewDecoder(f)
+	d.DisallowUnknownFields()
+	if err = d.Decode(&c); err != nil {
+		return c, fmt.Errorf("decode config: %w", err)
+	}
+	var extra any
+	if err = d.Decode(&extra); err != io.EOF {
+		return c, fmt.Errorf("config must contain one JSON object")
+	}
+	if len(c.Targets) == 0 {
+		return c, fmt.Errorf("config has no targets; use --root DIR for an ad hoc target")
+	}
+	seen := map[string]bool{}
+	for i := range c.Targets {
+		t := &c.Targets[i]
+		t.Dir, err = Normalize(t.Dir)
+		if err != nil {
+			return c, err
+		}
+		if seen[t.Dir] {
+			return c, fmt.Errorf("duplicate target %q", t.Dir)
+		}
+		seen[t.Dir] = true
+		if t.Days == 0 {
+			t.Days = 45
+		}
+		if t.Days < 1 {
+			return c, fmt.Errorf("days must be positive")
+		}
+		for _, p := range append(append([]string{}, t.Includes...), t.Excludes...) {
+			if p == "" || strings.ContainsAny(p, "\r\n") {
+				return c, fmt.Errorf("invalid empty or multiline pattern")
+			}
+			if _, err = filepath.Match(p, ""); err != nil {
+				return c, fmt.Errorf("invalid pattern %q: %w", p, err)
+			}
 		}
 	}
-
-	return ""
-}
-
-func configDir() string {
-	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
-		return dir
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".config")
-	}
-	return ""
+	return c, nil
 }

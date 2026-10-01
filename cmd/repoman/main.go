@@ -7,7 +7,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
-	"github.com/OWNER/REPO/internal/cli"
+	"github.com/richhaase/repoman/internal/cli"
 )
 
 var (

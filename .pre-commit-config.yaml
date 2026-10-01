@@ -21,7 +21,7 @@ repos:
 
       - id: go-imports
         name: goimports
-        entry: sh -c 'go tool goimports -w .'
+        entry: sh -c 'go tool goimports -local github.com/richhaase/repoman -w .'
         language: system
         types: [go]
         pass_filenames: false

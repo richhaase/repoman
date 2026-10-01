@@ -1,4 +1,4 @@
-module github.com/OWNER/REPO
+module github.com/richhaase/repoman
 
 go 1.26.5
 

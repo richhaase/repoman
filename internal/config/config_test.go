@@ -7,70 +7,44 @@ import (
 )
 
 func TestLoad(t *testing.T) {
-	tests := []struct {
-		name      string
-		env       map[string]string
-		wantDebug bool
+	for _, tt := range []struct {
+		name, input string
+		bad         bool
 	}{
-		{
-			name:      "defaults",
-			env:       map[string]string{"MYCLI_DEBUG": ""},
-			wantDebug: false,
-		},
-		{
-			name:      "debug via environment",
-			env:       map[string]string{"MYCLI_DEBUG": "true"},
-			wantDebug: true,
-		},
-		{
-			name:      "debug requires exact 'true'",
-			env:       map[string]string{"MYCLI_DEBUG": "1"},
-			wantDebug: false,
-		},
-	}
-
-	for _, tt := range tests {
+		{"valid", `{"targets":[{"dir":"~/src","owner":"me","events":false}]}`, false},
+		{"legacy", `{"targets":[{"dir":"~/src","owner":"me","days":45,"events":true,"includes":["a*"],"excludes":[]}]}`, false},
+		{"empty", `{"targets":[]}`, true},
+		{"unknown", `{"targets":[{"dir":"/tmp","owenr":"me"}]}`, true},
+		{"trailing", `{"targets":[]} {}`, true},
+		{"duplicate", `{"targets":[{"dir":"/tmp/a"},{"dir":"/tmp/a/../a"}]}`, true},
+		{"negative", `{"targets":[{"dir":"/tmp","days":-1}]}`, true},
+		{"pattern", `{"targets":[{"dir":"/tmp","includes":["["]}]}`, true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Chdir(t.TempDir())
-			for k, v := range tt.env {
-				t.Setenv(k, v)
+			p := filepath.Join(t.TempDir(), "config.json")
+			if e := os.WriteFile(p, []byte(tt.input), 0600); e != nil {
+				t.Fatal(e)
 			}
-
-			cfg, err := Load()
-			if err != nil {
-				t.Fatalf("Load() error = %v", err)
+			c, e := Load(p)
+			if (e != nil) != tt.bad {
+				t.Fatalf("Load=%+v,%v", c, e)
 			}
-			if cfg.Debug != tt.wantDebug {
-				t.Errorf("cfg.Debug = %v, want %v", cfg.Debug, tt.wantDebug)
+			if !tt.bad && (c.Targets[0].Days != 45 || !filepath.IsAbs(c.Targets[0].Dir)) {
+				t.Fatalf("defaults=%+v", c)
 			}
 		})
 	}
 }
-
-func TestDefaultConfig(t *testing.T) {
-	cfg := DefaultConfig()
-	if cfg.Debug {
-		t.Error("DefaultConfig().Debug = true, want false")
+func TestNormalize(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	p, e := Normalize("~/src")
+	if e != nil || p != filepath.Join(os.Getenv("HOME"), "src") {
+		t.Fatalf("Normalize=%q,%v", p, e)
 	}
 }
-
-func TestConfigDir(t *testing.T) {
-	t.Run("XDG_CONFIG_HOME wins when set", func(t *testing.T) {
-		t.Setenv("XDG_CONFIG_HOME", "/custom/config")
-		if got := configDir(); got != "/custom/config" {
-			t.Errorf("configDir() = %q, want %q", got, "/custom/config")
-		}
-	})
-
-	t.Run("falls back to ~/.config on every platform", func(t *testing.T) {
-		t.Setenv("XDG_CONFIG_HOME", "")
-		home, err := os.UserHomeDir()
-		if err != nil {
-			t.Skipf("no home dir: %v", err)
-		}
-		want := filepath.Join(home, ".config")
-		if got := configDir(); got != want {
-			t.Errorf("configDir() = %q, want %q (never Application Support)", got, want)
-		}
-	})
+func TestDefaultPath(t *testing.T) {
+	t.Setenv("REPOMAN_CONFIG", "custom.json")
+	if DefaultPath() != "custom.json" {
+		t.Fatal(DefaultPath())
+	}
 }

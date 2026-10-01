@@ -18,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Verify dependencies
         run: |
@@ -28,11 +28,6 @@ jobs:
       - name: Run tests
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v7
-        with:
-          files: coverage.out
-          fail_ci_if_error: false
 
   lint:
     runs-on: ubuntu-latest
@@ -42,7 +37,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -57,7 +52,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -71,10 +66,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Build
-        run: go build -v ./cmd/mycli
+        run: go build -v ./cmd/repoman
 
   build-matrix:
     runs-on: ubuntu-latest
@@ -89,11 +84,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: Build for ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -v -o mycli-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/mycli
+        run: go build -v -o repoman-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/repoman

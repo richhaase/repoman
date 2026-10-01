@@ -4,7 +4,7 @@ This file provides guidance for AI assistants working with this codebase.
 
 ## Project Overview
 
-This is a Go CLI application built with Cobra. It follows standard Go project layout conventions.
+repoman is a conservative Go CLI for local clone/worktree inventory, safe GitHub synchronization, and plan-first cleanup. It was bootstrapped from richhaase/go-cli-template and follows its Cobra constructor and build conventions.
 
 ## Build & Test Commands
 
@@ -25,17 +25,19 @@ make clean             # Clean build artifacts
 
 ```
 .
-├── cmd/mycli/          # Main entry point (thin wrapper)
+├── cmd/repoman/          # Main entry point (thin wrapper)
 │   └── main.go         # Version injection, signal handling, calls cli.Execute()
 ├── internal/
 │   ├── cli/            # Cobra command definitions
 │   │   ├── root.go     # Root command, Execute(), slog setup
 │   │   ├── version.go  # Version command
 │   │   └── *.go        # Additional commands
-│   ├── domain/         # Core business logic (no external deps)
+│   ├── repository/     # Read-only Git/process inventory
+│   ├── syncer/         # GitHub activity selection and safe clone/FF
+│   ├── cleanup/        # Conservative cleanup proof and revalidation
+│   ├── domain/         # Reserved core domain package
 │   ├── config/         # Configuration loading
 │   └── terminal/       # TTY detection helpers
-├── scripts/            # Bootstrap tooling (setup.sh)
 └── .github/workflows/  # CI and release automation
 ```
 
@@ -61,7 +63,7 @@ previous run's value.
 - `main()` installs `signal.NotifyContext` (SIGINT/SIGTERM) and calls
   `rootCmd.ExecuteContext(ctx)`
 - Long-running commands should read `cmd.Context()` and stop when it is
-  canceled (see `internal/cli/example.go`)
+  canceled (see `internal/cli/operations.go`)
 
 ### Logging
 
@@ -121,31 +123,27 @@ stdlib paths. Bump it to a current patch release; do not round it down.
 ## Testing
 
 - Tests live alongside code: `foo.go` → `foo_test.go`
-- Use table-driven tests for multiple cases (see `internal/cli/example_test.go`)
+- Use table-driven tests for multiple cases (see `internal/cli/operations_test.go`)
 - Drive Cobra commands by calling `NewRootCmd` per invocation, then
   `SetArgs` + `SetOut`/`SetErr` buffers (see `executeCommand` in
-  `internal/cli/example_test.go`). Building a fresh tree each time is what
+  `internal/cli/operations_test.go`). Building a fresh tree each time is what
   keeps cases independent; there is no flag state to reset by hand.
 - Use `t.TempDir()` for temp directories and `t.Setenv()` for env vars
   (see `internal/config/config_test.go`)
 
 ## Common Tasks
 
-### Rename the CLI
+### Safety constraints
 
-Use the bootstrap script, which handles all of the below (module path,
-binary name, env-var prefix, README cleanup, LICENSE):
-
-```bash
-./scripts/setup.sh -o myuser -r my-cli
-```
-
-Manual equivalent:
-1. Update `BINARY` in `Makefile`
-2. Update `Use` in `internal/cli/root.go`
-3. Update `main` and `binary` in `.goreleaser.yaml`
-4. Update module path in `go.mod` and all imports
-5. Update the `MYCLI_*` env-var prefix in `internal/config/config.go`
+- Never invoke the original sync-repos/clean-repos scripts or mutate a user's real data in tests.
+- Tests use t.TempDir Git fixtures and fake GitHub metadata; no network is needed.
+- Keep unknown state distinct from clean. Cleanup must protect hidden index flags,
+  local-only work, ignored/untracked files, locks, in-use paths, and primary clones.
+- Keep cleanup default preview; apply revalidates identity, local state, and PR proof.
+- Do not add forced checkout, reset, worktree removal, or primary clone deletion.
+- Process observation explicitly covers the current OS user, not the whole system.
+- JSON schema version 1 and human rendering share engine results. Stdout is data;
+  diagnostics go to stderr. Preserve cancellation and partial failure exit codes.
 
 ### Add a Dependency
 
